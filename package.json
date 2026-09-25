@@ -1,0 +1,47 @@
+{
+  "name": "jev-infinite-ctx",
+  "version": "0.1.0",
+  "description": "Long-context decision wrapper for TypeSafe Jev: token-aware chunking, overlap-corrected aggregation, and C3 cross-chunk confidence calibration for choice, score, and noul questions.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "npm run typecheck && npm test && npm run build"
+  },
+  "keywords": [
+    "jev",
+    "typesafe",
+    "openrouter",
+    "decisions",
+    "long-context",
+    "chunking",
+    "classification",
+    "calibration"
+  ],
+  "devDependencies": {
+    "@types/node": "^22.20.4",
+    "fast-check": "^4.10.2",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.2"
+  }
+}
