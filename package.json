@@ -3,6 +3,12 @@
   "version": "0.2.0",
   "description": "Ask Jev one question about inputs up to 250K tokens: overlapping chunks, one combined answer.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/taylorbayouth/jev-long.git"
+  },
+  "homepage": "https://github.com/taylorbayouth/jev-long#readme",
+  "bugs": "https://github.com/taylorbayouth/jev-long/issues",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
