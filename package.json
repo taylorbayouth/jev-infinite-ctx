@@ -28,7 +28,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "check": "npm run typecheck && npm test && npm run build"
+    "check": "npm run typecheck && npm test && npm run build",
+    "smoke:live": "npm run build && node scripts/live-smoke.mjs"
   },
   "keywords": [
     "jev",
