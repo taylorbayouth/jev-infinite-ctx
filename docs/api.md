@@ -12,11 +12,11 @@ Returns a promise of `ChoiceResult`, `ScoreResult`, or `NoulResult`, depending o
 | --- | --- | --- |
 | `input` | required | The text. Must contain something other than whitespace, and be at most `maxInputTokens`. |
 | `question` | required | A Jev question (below). |
-| `combine` | `"average"` | `"average"`, or `"max"` for `noul` and `score` questions about whether something appears anywhere. |
+| `combine` | `"average"` | `"average"`, or `"max"` for `noul` and `score` questions about whether something appears anywhere. TypeScript rejects `"max"` for `choice`. |
 | `maxInputTokens` | `250000` | Largest input accepted, in estimated tokens. A positive integer. |
 | `model` | `"typesafe/jev-1.13"` | Model id sent with each request. |
-| `apiKey` | `process.env.OPENROUTER_API_KEY` | Bearer key for the default transport. |
-| `url` | `"https://openrouter.ai/api/alpha/decisions"` | Endpoint for the default transport. |
+| `apiKey` | `process.env.OPENROUTER_API_KEY` | Bearer key for the default transport. The environment key is used only when `url` is left at its default, so it is never sent anywhere else. |
+| `url` | `"https://openrouter.ai/api/alpha/decisions"` | Endpoint for the default transport: `http` or `https`, with no username or password. Pass `apiKey` with it. |
 | `transport` | HTTP POST to `url` | Your own request function (below). `apiKey` and `url` are then unused. |
 | `signal` | none | An `AbortSignal` to cancel the call. |
 
@@ -82,9 +82,9 @@ The only error `decide()` throws.
 | Property | |
 | --- | --- |
 | `code` | `"invalid_request"`, `"input_too_large"`, `"request_failed"`, or `"aborted"` |
-| `message` | What went wrong. The built-in transport never puts input text in it. |
+| `message` | What went wrong. The built-in transport leaves out the provider's message if it shares 20 or more consecutive characters with the input. |
 | `chunk` | For `request_failed`: the 0-based index of the chunk that failed. |
-| `status` | For `request_failed`: the provider's HTTP status, if there was one. |
+| `status` | For `request_failed`: the provider's HTTP status, if there was one. A rejection for length is always reported as 413. |
 | `cause` | The underlying error. |
 
 ## Calling TypeSafe directly
@@ -129,7 +129,7 @@ To control what happens on failure, throw an error with a numeric `status`:
 - `413` means the chunk was too long, so the input is planned again with smaller chunks.
 - Anything else fails the call.
 
-A `TypeError` counts as a network error and is retried. Honor `signal`.
+A `TypeError` counts as a network error and is retried. Honor `signal`: when it fires, `decide()` stops waiting either way, and a late response is dropped.
 
 In tests, a transport can simply return canned answers:
 

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { HttpError, OPENROUTER_URL, httpTransport } from "../src/http.js";
 import type { DecisionsRequest } from "../src/index.js";
 
-const STATE = "Granite forms when magma cools slowly deep underground.";
+const STATE = "Granite forms when magma cools slowly deep underground. Billed to J. Smith, SSN 123-45-6789, was paid.";
 const REQUEST: DecisionsRequest = {
   model: "typesafe/jev-1.13",
   state: STATE,
@@ -53,6 +53,21 @@ describe("httpTransport", () => {
     respond(400, { error: { message: `Invalid state: ${STATE}` } });
     const error = (await call().catch((e: unknown) => e)) as HttpError;
     expect(error.message).toBe("openrouter.ai returned HTTP 400");
+  });
+
+  it("withholds a provider message that quotes 20 or more characters of the input, wherever the quote starts", async () => {
+    for (const message of ['Bad token " Smith, SSN 123-45-6789, was"', "Rejected span:  SSN 123-45-6789, wa"]) {
+      respond(400, { error: { message } });
+      const error = (await call().catch((e: unknown) => e)) as HttpError;
+      expect(error.message).toBe("openrouter.ai returned HTTP 400");
+    }
+  });
+
+  it("treats only context-length messages as too long, including OpenRouter's nested upstream error", async () => {
+    respond(400, { error: { message: "criteria[rock] is too long; the token limit for a criterion is 500" } });
+    await expect(call()).rejects.toMatchObject({ status: 400 });
+    respond(400, { error: { message: "Provider returned error", metadata: { raw: '{"error":"context_length_exceeded"}' } } });
+    await expect(call()).rejects.toMatchObject({ status: 413 });
   });
 
   it("rejects a success response that is not JSON", async () => {

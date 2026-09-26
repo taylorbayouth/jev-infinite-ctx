@@ -25,7 +25,7 @@ export function labelsOf(question: Question): string[] {
     case "choice":
       return Object.keys(question.criteria);
     case "score":
-      return question.criteria.map((_, level) => String(level));
+      return Array.from({ length: question.criteria.length }, (_, level) => String(level));
     case "noul":
       return ["no", "yes"];
   }
@@ -54,9 +54,10 @@ export function validateQuestion(question: unknown): asserts question is Questio
     if (!Array.isArray(criteria) || criteria.length < 2 || criteria.length > 10) {
       throw invalid("A score question needs 2 to 10 levels in criteria.");
     }
-    criteria.forEach((level, i) => {
-      if (!isCriterion(level)) throw invalid(`question.criteria[${i}] must be a non-empty string, or JSON.`);
-    });
+    // An index loop, not forEach, so holes in a sparse array are rejected instead of skipped.
+    for (let i = 0; i < criteria.length; i++) {
+      if (!isCriterion(criteria[i])) throw invalid(`question.criteria[${i}] must be a non-empty string, or JSON.`);
+    }
   } else if (
     criteria !== undefined &&
     !(isRecord(criteria) && Object.keys(criteria).length === 2 && isCriterion(criteria.true) && isCriterion(criteria.false))

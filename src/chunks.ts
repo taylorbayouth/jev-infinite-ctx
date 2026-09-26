@@ -12,8 +12,12 @@ const BYTES_PER_TOKEN = 3;
 /** Each chunk repeats about 5% of the previous one, so no sentence loses its context at a boundary. */
 const OVERLAP = 0.05;
 
-/** Line breaks and sentence ends: chunks break only here, unless a sentence is too long. */
-const BREAK = /\n+|[.!?]+["'”’)\]]*\s+|[。！？]+["'”’)\]]*\s*/g;
+/**
+ * Line breaks and sentence ends: chunks break only here, unless a sentence is too long. One
+ * terminator is enough (a run like "..." still ends at the same place); matching the whole run
+ * would backtrack quadratically over a long run of dots.
+ */
+const BREAK = /\n+|[.!?]["'”’)\]]*\s+|[。！？]+["'”’)\]]*\s*/g;
 
 export interface Span {
   start: number;

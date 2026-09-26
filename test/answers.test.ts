@@ -32,6 +32,12 @@ describe("validateQuestion", () => {
     expect(() => validateQuestion(question)).toThrow(expect.objectContaining({ code: "invalid_request" }));
   });
 
+  it("rejects a rubric with holes in it", () => {
+    const levels = ["none", "minor", "major"];
+    delete levels[1];
+    expect(() => validateQuestion({ ...SCORE, criteria: levels })).toThrow(expect.objectContaining({ code: "invalid_request" }));
+  });
+
   it("rejects a question that is not JSON", () => {
     const criteria: Record<string, unknown> = { a: "A" };
     criteria.b = { loop: criteria };

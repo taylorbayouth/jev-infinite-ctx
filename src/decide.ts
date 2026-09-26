@@ -34,7 +34,7 @@ export async function decide<Q extends Question>(options: DecideOptions<Q>): Pro
       const result = {
         ...combine(run.question, spans, answers, run.combine),
         model: run.answeredBy ?? run.model,
-        usage: run.usage,
+        usage: { ...run.usage },
       };
       return result as unknown as ResultFor<Q>;
     } catch (error) {
@@ -43,7 +43,9 @@ export async function decide<Q extends Question>(options: DecideOptions<Q>): Pro
       const span = spans[error.chunk]!;
       maxTokens = Math.floor(Math.min(maxTokens, estimateTokens(run.input.slice(span.start, span.end))) * 0.75);
       if (replans === MAX_REPLANS || maxTokens < MIN_CHUNK_TOKENS) {
-        throw failed(error.chunk, spans.length, error.cause, "Jev rejected it as too long, even after shrinking chunks");
+        const shrunk = replans > 0 ? `, even after shrinking chunks ${replans} time${replans === 1 ? "" : "s"}` : "";
+        const detail = error.cause instanceof Error ? ` (${error.cause.message})` : "";
+        throw failed(error.chunk, spans.length, error.cause, `Jev rejected it as too long${shrunk}${detail}`);
       }
     }
   }
@@ -74,7 +76,7 @@ function prepare(options: DecideOptions): Run {
   if (!Number.isSafeInteger(maxInputTokens) || maxInputTokens <= 0) throw invalid("maxInputTokens must be a positive integer.");
   if (typeof model !== "string" || model.trim() === "") throw invalid("model must be a non-empty string.");
   if (signal !== undefined && !(signal instanceof AbortSignal)) throw invalid("signal must be an AbortSignal.");
-  const transport = options.transport ?? defaultTransport(options.url, options.apiKey);
+  const transport = options.transport === undefined ? defaultTransport(options.url, options.apiKey) : options.transport;
   if (typeof transport !== "function") throw invalid("transport must be a function.");
   chunkTokens(question); // Rejects an oversized question before any request.
 
@@ -91,11 +93,26 @@ function prepare(options: DecideOptions): Run {
 }
 
 function defaultTransport(url: unknown, apiKey: unknown): Transport {
-  const key = apiKey ?? (typeof process === "undefined" ? undefined : process.env["OPENROUTER_API_KEY"]);
-  if (typeof key !== "string" || key.trim() === "") throw invalid("No API key: set OPENROUTER_API_KEY, or pass apiKey.");
-  const endpoint = url ?? OPENROUTER_URL;
-  if (typeof endpoint !== "string" || !URL.canParse(endpoint)) throw invalid("url must be an absolute URL.");
-  return httpTransport(endpoint, key);
+  if (url !== undefined && !isHttpUrl(url)) throw invalid("url must be an http or https URL, without a username or password.");
+  // The OpenRouter key from the environment is only ever sent to OpenRouter.
+  const key = apiKey !== undefined ? apiKey : url === undefined ? env("OPENROUTER_API_KEY") : undefined;
+  if (key === undefined || (typeof key === "string" && key.trim() === "")) {
+    throw invalid(url === undefined ? "No API key: set OPENROUTER_API_KEY, or pass apiKey." : "Pass apiKey along with url.");
+  }
+  if (typeof key !== "string" || !/^[\x21-\x7e]+$/.test(key.trim())) {
+    throw invalid("apiKey must be printable ASCII, without spaces or line breaks.");
+  }
+  return httpTransport(url ?? OPENROUTER_URL, key.trim());
+}
+
+function isHttpUrl(value: unknown): value is string {
+  if (typeof value !== "string" || !URL.canParse(value)) return false;
+  const { protocol, username, password } = new URL(value);
+  return (protocol === "https:" || protocol === "http:") && username === "" && password === "";
+}
+
+function env(name: string): string | undefined {
+  return typeof process === "undefined" ? undefined : process.env[name];
 }
 
 /** The largest chunk Jev can take alongside this question. */
@@ -107,11 +124,16 @@ function chunkTokens(question: Question): number {
   return tokens;
 }
 
-/** Asks about every chunk, a few at a time. The first failure cancels the rest and fails the call. */
+/**
+ * Asks about every chunk, a few at a time. The first failure cancels the rest
+ * and fails the call once every worker has stopped. Workers stop promptly
+ * because each request races its signal, and a late answer is never counted.
+ */
 async function askAll(run: Run, spans: readonly Span[]): Promise<ChunkAnswer[]> {
   const pass = new AbortController();
   const signal = run.signal ? AbortSignal.any([run.signal, pass.signal]) : pass.signal;
   const answers: ChunkAnswer[] = [];
+  let failure: { error: unknown } | undefined;
   let next = 0;
   const worker = async (): Promise<void> => {
     while (next < spans.length && !signal.aborted) {
@@ -119,12 +141,13 @@ async function askAll(run: Run, spans: readonly Span[]): Promise<ChunkAnswer[]> 
       try {
         answers[index] = await ask(run, spans, index, signal);
       } catch (error) {
+        failure ??= { error };
         pass.abort();
-        throw error;
       }
     }
   };
   await Promise.all(Array.from({ length: Math.min(CONCURRENCY, spans.length) }, worker));
+  if (failure) throw failure.error;
   // A caller abort between requests stops the workers without an error of their own.
   if (run.signal?.aborted) throw aborted(run.signal);
   return answers;
@@ -143,7 +166,7 @@ async function ask(run: Run, spans: readonly Span[], index: number, pass: AbortS
     let response: unknown;
     try {
       run.usage.requests++;
-      response = await run.transport(request, signal);
+      response = await untilAborted(run.transport(request, signal), signal);
     } catch (error) {
       if (pass.aborted) throw stopped(run, error);
       const timedOut = signal.aborted;
@@ -177,6 +200,19 @@ class TooLong extends Error {
   ) {
     super("Chunk too long for Jev.");
   }
+}
+
+/**
+ * Settles like `promise`, but rejects as soon as `signal` aborts, so a
+ * transport that ignores its signal cannot hang the call. A late result is dropped.
+ */
+function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const onAbort = (): void => reject(signal.reason);
+    if (signal.aborted) onAbort();
+    signal.addEventListener("abort", onAbort, { once: true });
+    Promise.resolve(promise).then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
 }
 
 function record(run: Run, response: unknown): void {

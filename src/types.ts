@@ -44,9 +44,9 @@ export interface DecideOptions<Q extends Question = Question> {
    * How chunk answers become one answer. "average" (default) suits questions
    * about the input as a whole. "max" takes the chunk with the highest score
    * or yes-probability, for noul and score questions about whether something
-   * appears anywhere.
+   * appears anywhere; choice answers are always averaged.
    */
-  combine?: "average" | "max" | undefined;
+  combine?: (Q extends ChoiceQuestion ? "average" : "average" | "max") | undefined;
   /** Largest accepted input, in estimated tokens (see `estimateTokens`). Default 250,000. */
   maxInputTokens?: number | undefined;
   /** Jev model id. Default "typesafe/jev-1.13". */

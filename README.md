@@ -59,7 +59,7 @@ Questions are exactly Jev's: `choice` picks one of your options, `score` places 
 | --- | --- |
 | `choice`, `score`, or `noul` | The answer, in Jev's format for the question type. |
 | `probabilities` | Combined probability of each option or score level (`choice` and `score`). |
-| `confidence` | Jev's own confidence, averaged across chunks (`choice` and `score`, as in Jev). |
+| `confidence` | Jev's own confidence, averaged across chunks, or the winning chunk's with `max` (`choice` and `score`, as in Jev). |
 | `agreement` | How consistently the chunks answered, from 0 to 1. 1 means every chunk said the same thing. |
 | `chunks` | Where each chunk sits in the input, its weight, and Jev's answer for it. |
 

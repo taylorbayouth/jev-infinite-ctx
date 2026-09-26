@@ -20,7 +20,7 @@ tokens = ceil(UTF-8 bytes / 3)        // estimateTokens()
 
 Jev's tokenizer is not public, so jev-long uses a rule that is simple, conservative, and exactly additive. Common tokenizers average about 4 bytes per token on English prose, so the rule over-counts English by about a third. Code, JSON, and CJK text come out close to 3 bytes per token. `maxInputTokens` (default 250,000) is checked with the same rule.
 
-If Jev still rejects a chunk as too long (HTTP 413, or a 400 or 422 that mentions the context length), the budget shrinks to 75% of that chunk's estimate and the whole input is planned again. After 3 shrinks, the call fails.
+If Jev still rejects a chunk as too long (HTTP 413, or a 400 or 422 whose error message mentions the context length or window), the budget shrinks to 75% of that chunk's estimate and the whole input is planned again. After 3 shrinks, the call fails.
 
 ## 3. Chunks
 
@@ -76,8 +76,8 @@ Identical answers give 1. Two chunks that give opposite, certain answers give 0.
 
 - Four at a time, each with a 60-second timeout.
 - Retried up to 3 times, with exponential backoff and jitter (waits of up to 0.5 s, 1 s, then 2 s): HTTP 408, 429, and 5xx, network errors, and timeouts. `Retry-After` is honored, up to 30 seconds.
-- Any other failure, or a malformed answer, fails the call with `request_failed` and cancels the chunks still in flight. No answer is computed from part of the input.
-- Error messages include the provider's own message, unless it quotes the input (any 20-character run in common). That way input text never ends up in an error that gets logged.
+- Any other failure, or a malformed answer, fails the call with `request_failed` and cancels the chunks still in flight. No answer is computed from part of the input. A cancelled or timed-out request is not waited for, and a late response is dropped.
+- Error messages include the provider's own message, unless it shares 20 or more consecutive characters with the input. That keeps quoted input out of errors that get logged.
 
 ## Design notes
 

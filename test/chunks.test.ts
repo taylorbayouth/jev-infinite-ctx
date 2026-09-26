@@ -98,6 +98,15 @@ describe("planChunks", () => {
     expectValidPlan(text, 2000, planChunks(text, 2000));
   });
 
+  it("stays fast on long runs of punctuation", () => {
+    for (const text of [".".repeat(300_000) + "x", "!?".repeat(150_000) + "x", "?".repeat(100_000) + " end."]) {
+      const started = performance.now();
+      const plan = planChunks(text, 28_000);
+      expect(performance.now() - started).toBeLessThan(1000);
+      expectValidPlan(text, 28_000, plan);
+    }
+  });
+
   it("plans a 1 MB input quickly", () => {
     const text = prose(13_000);
     expect(bytes(text)).toBeGreaterThan(1_000_000);

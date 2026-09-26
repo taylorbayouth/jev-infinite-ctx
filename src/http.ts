@@ -4,10 +4,10 @@ import type { DecisionsResponse, Transport } from "./types.js";
 
 export const OPENROUTER_URL = "https://openrouter.ai/api/alpha/decisions";
 
-/** A 400 or 422 whose message says this means the chunk was too long for Jev. */
-const TOO_LONG = /context (length|window)|maximum context|too many tokens|token limit|too long|too large/i;
+/** Phrases a provider uses when the input exceeds the model's context. */
+const TOO_LONG = /context[ _-]?(length|window|limit)|maximum context|too many (input )?tokens|(input|prompt|state) (is )?too (long|large)/i;
 
-/** An HTTP failure. `status` 413 means "too long", whatever status the provider used. */
+/** An HTTP failure. `status` 413 means "too long", whatever status the provider used for it. */
 export class HttpError extends Error {
   override name = "HttpError";
   constructor(
@@ -31,8 +31,9 @@ export function httpTransport(url: string, apiKey: string): Transport {
     });
     const body = await response.text();
     if (!response.ok) {
-      const tooLong = (response.status === 400 || response.status === 422) && TOO_LONG.test(body);
-      const detail = providerMessage(body, request.state);
+      const { message, raw } = providerError(body);
+      const tooLong = (response.status === 400 || response.status === 422) && TOO_LONG.test(`${message}\n${raw}`);
+      const detail = safeDetail(message, request.state);
       throw new HttpError(
         `${host} returned HTTP ${response.status}${detail ? `: ${detail}` : ""}`,
         tooLong ? 413 : response.status,
@@ -47,22 +48,26 @@ export function httpTransport(url: string, apiKey: string): Transport {
   };
 }
 
-/**
- * The provider's own error message, for diagnostics. Withheld if it quotes
- * the chunk (any 20-character run in common), so input text never reaches an
- * error message that might be logged.
- */
-function providerMessage(body: string, state: string): string | undefined {
-  let message: unknown;
+/** The provider's error message, and the upstream error OpenRouter nests in `metadata.raw`. */
+function providerError(body: string): { message: string; raw: string } {
   try {
-    const parsed = JSON.parse(body) as { error?: { message?: unknown }; message?: unknown } | null;
-    message = parsed?.error?.message ?? parsed?.message;
+    const parsed = JSON.parse(body) as { error?: { message?: unknown; metadata?: { raw?: unknown } }; message?: unknown } | null;
+    const message = parsed?.error?.message ?? parsed?.message;
+    const raw = parsed?.error?.metadata?.raw;
+    return { message: typeof message === "string" ? message : "", raw: typeof raw === "string" ? raw : "" };
   } catch {
-    return undefined;
+    return { message: "", raw: "" };
   }
-  if (typeof message !== "string") return undefined;
+}
+
+/**
+ * The provider's message, trimmed, for diagnostics. Withheld if it shares any
+ * 20 consecutive characters with the chunk, so a provider that quotes the
+ * input does not put it in an error message that might be logged.
+ */
+function safeDetail(message: string, state: string): string | undefined {
   const text = message.trim().slice(0, 200);
-  for (let i = 0; i === 0 || i + 20 <= text.length; i += 10) {
+  for (let i = 0; i === 0 || i + 20 <= text.length; i++) {
     if (state.includes(text.slice(i, i + 20))) return undefined;
   }
   return text || undefined;

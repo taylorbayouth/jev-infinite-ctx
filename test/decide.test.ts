@@ -78,6 +78,7 @@ describe("decide", () => {
     const jev = fakeJev((state) => noul(/forest/.test(state) ? 0.97 : 0.02));
     const result = await decide({ input: LONG, question: FORESTS, combine: "max", transport: jev.transport });
     expect(result.noul).toBe(0.97);
+    // @ts-expect-error choice answers are always averaged, so the types reject "max" too
     await expect(decide({ input: LONG, question: TOPIC, combine: "max", transport: jev.transport })).rejects.toMatchObject({ code: "invalid_request" });
   });
 
@@ -159,13 +160,40 @@ describe("decide", () => {
     expect(result.usage.requests).toBeGreaterThan(result.chunks.length);
   });
 
-  it("fails if Jev keeps saying chunks are too long", async () => {
+  it("fails if Jev keeps saying chunks are too long, and says why", async () => {
     const jev = fakeJev(() => {
       throw httpError(413);
     });
     const error = await failure(decide({ input: LONG, question: TOPIC, transport: jev.transport }));
     expect(error).toMatchObject({ code: "request_failed", status: 413 });
-    expect(error.message).toContain("too long");
+    expect(error.message).toMatch(/too long, even after shrinking chunks 3 times \(HTTP 413\)$/);
+    const single = await failure(decide({ input: "Granite.", question: TOPIC, transport: jev.transport }));
+    expect(single.message).toMatch(/failed: Jev rejected it as too long \(HTTP 413\)$/);
+  });
+
+  it("stops promptly on abort, even if the transport ignores its signal", async () => {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 50);
+    const started = performance.now();
+    const error = await failure(
+      decide({ input: "Granite.", question: TOPIC, transport: () => new Promise(() => {}), signal: controller.signal }),
+    );
+    expect(error.code).toBe("aborted");
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
+
+  it("does not wait for, or count, late answers from a cancelled pass", async () => {
+    const jev = fakeJev(async (state, _, call) => {
+      if (call === 0) throw httpError(413); // cancels the first pass...
+      if (call < 4) await new Promise((resolve) => setTimeout(resolve, 300)); // ...whose other requests ignore the signal
+      return byTopic(state);
+    });
+    const started = performance.now();
+    const result = await decide({ input: LONG, question: TOPIC, transport: jev.transport });
+    expect(performance.now() - started).toBeLessThan(250);
+    const usage = JSON.stringify(result.usage);
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    expect(JSON.stringify(result.usage)).toBe(usage);
   });
 
   it("stops when the caller aborts", async () => {
@@ -198,5 +226,32 @@ describe("decide", () => {
     vi.stubEnv("OPENROUTER_API_KEY", "");
     const error = await failure(decide({ input: "Granite.", question: TOPIC }));
     expect(error).toMatchObject({ code: "invalid_request", message: expect.stringContaining("OPENROUTER_API_KEY") });
+  });
+
+  describe("before sending anything", () => {
+    afterEach(() => vi.restoreAllMocks());
+
+    it("never sends the OpenRouter key from the environment to another URL", async () => {
+      vi.stubEnv("OPENROUTER_API_KEY", "sk-or-secret");
+      const fetch = vi.spyOn(globalThis, "fetch");
+      const error = await failure(decide({ input: "Granite.", question: TOPIC, url: "https://api.typesafe.ai/v1/systemone" }));
+      expect(error).toMatchObject({ code: "invalid_request", message: "Pass apiKey along with url." });
+      expect(fetch).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["a key with a line break", { apiKey: "sk-secret\nX-Evil: 1" }],
+      ["a URL with credentials", { apiKey: "sk-secret", url: "https://svc:hunter2@gateway.example.com/decisions" }],
+      ["a URL that is not http", { apiKey: "sk-secret", url: "ftp://gateway.example.com/decisions" }],
+      ["a null transport", { transport: null }],
+      ["a null url", { apiKey: "sk-secret", url: null }],
+    ])("rejects %s, without repeating secrets", async (_, override) => {
+      const fetch = vi.spyOn(globalThis, "fetch");
+      const options = { input: "Granite.", question: TOPIC, ...override };
+      const error = await failure(decide(options as Parameters<typeof decide>[0]));
+      expect(error.code).toBe("invalid_request");
+      expect(error.message).not.toMatch(/sk-secret|hunter2/);
+      expect(fetch).not.toHaveBeenCalled();
+    });
   });
 });
