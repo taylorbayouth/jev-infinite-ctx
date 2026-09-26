@@ -1,8 +1,14 @@
 {
-  "name": "jev-infinite-ctx",
-  "version": "0.1.0",
-  "description": "Long-context decision wrapper for TypeSafe Jev: token-aware chunking, overlap-corrected aggregation, and C3 cross-chunk confidence calibration for choice, score, and noul questions.",
+  "name": "jev-long",
+  "version": "0.2.0",
+  "description": "Ask Jev one question about inputs up to 250K tokens: overlapping chunks, one combined answer.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/taylorbayouth/jev-long.git"
+  },
+  "homepage": "https://github.com/taylorbayouth/jev-long#readme",
+  "bugs": "https://github.com/taylorbayouth/jev-long/issues",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -15,12 +21,12 @@
   },
   "files": [
     "dist",
-    "src",
+    "docs",
     "README.md"
   ],
   "sideEffects": false,
   "engines": {
-    "node": ">=20"
+    "node": ">=20.3"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -37,9 +43,8 @@
     "openrouter",
     "decisions",
     "long-context",
-    "chunking",
     "classification",
-    "calibration"
+    "chunking"
   ],
   "devDependencies": {
     "@types/node": "^22.20.4",
