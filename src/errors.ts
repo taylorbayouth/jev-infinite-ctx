@@ -44,9 +44,14 @@ export interface JevProviderErrorOptions {
   /** Overrides the default retryability derived from `kind`. */
   retryable?: boolean | undefined;
   /**
-   * Provider response body, truncated. Built-in transports redact echoes of
-   * the request state on a best-effort basis (every shared run of 8 or more
-   * characters, including JSON-escaped ones).
+   * Provider response body, truncated to 2,000 characters. For a request with
+   * a non-empty state, built-in transports replace the whole body with
+   * "[withheld: provider error body overlaps the request state]" when any run
+   * of 8 characters in that truncated body or in the 128 characters after the
+   * cut (as sent, or with up to three levels of JSON string escapes decoded)
+   * also occurs in the state, comparing with whitespace runs collapsed to one
+   * space. A state shorter than 8 characters withholds the body when the body
+   * contains it.
    */
   body?: string | undefined;
   cause?: unknown;

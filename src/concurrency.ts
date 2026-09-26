@@ -8,6 +8,7 @@
  */
 
 import { JevAbortError, JevInfiniteCTXError } from "./errors.js";
+import { abortError } from "./internal.js";
 
 export interface MapWithConcurrencyOptions {
   /** Cancels the whole map: no new items start and in-flight items see an aborted signal. */
@@ -98,8 +99,4 @@ export async function mapWithConcurrency<T, R>(
     throw failure.error;
   }
   return results;
-}
-
-function abortError(signal: AbortSignal | undefined): JevAbortError {
-  return new JevAbortError("The operation was aborted.", { cause: signal?.reason });
 }

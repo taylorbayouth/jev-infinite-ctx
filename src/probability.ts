@@ -13,6 +13,7 @@
 
 import { NOUL_LABELS, PROBABILITY_SUM_TOLERANCE } from "./defaults.js";
 import { JevInfiniteCTXError, JevResponseError } from "./errors.js";
+import { quote } from "./internal.js";
 import type { Distribution, JevQuestion, NativeJevAnswer } from "./types.js";
 
 /** Tiny negative probabilities (float noise from the provider) are clamped to 0. */
@@ -26,9 +27,6 @@ const SCALAR_RANGE_TOLERANCE = 1e-6;
  * evaluates to 0.10000000000000009, just outside a 0.1 tolerance.
  */
 const SUM_FLOAT_SLACK = 1e-12;
-
-/** Longest label/type echoed back in an error message. */
-const MAX_ECHO_LENGTH = 64;
 
 /**
  * Ordered labels for a question (spec 8):
@@ -57,7 +55,7 @@ export function toDistribution(question: JevQuestion, answer: NativeJevAnswer): 
   assertAnswerObject(answer);
   if (answer.type !== question.type) {
     throw new JevResponseError(
-      `Jev returned answer type ${describeLabel(answer.type)} for a "${question.type}" question.`,
+      `Jev returned answer type ${describeAnswerType(answer.type)} for a "${question.type}" question.`,
     );
   }
 
@@ -67,7 +65,7 @@ export function toDistribution(question: JevQuestion, answer: NativeJevAnswer): 
       const choice: unknown = answer.choice;
       if (typeof choice !== "string" || !labels.includes(choice)) {
         throw new JevResponseError(
-          `Jev choice ${describeLabel(choice)} is not one of the question's criteria keys.`,
+          `Jev choice ${describeReturned(choice)} is not one of the question's criteria keys.`,
         );
       }
       return { labels, probs: parseProbabilityMap(labels, answer.probabilities, "choice") };
@@ -201,7 +199,7 @@ function parseProbabilityMap(labels: readonly string[], map: unknown, type: stri
     const j = indexOf.get(key);
     if (j === undefined) {
       throw new JevResponseError(
-        `Jev ${type} probabilities contain unknown label ${describeLabel(key)}.`,
+        `Jev ${type} probabilities contain an unknown label, ${describeReturned(key)}.`,
       );
     }
     if (typeof value !== "number" || !Number.isFinite(value)) {
@@ -250,18 +248,31 @@ function unknownQuestionType(question: never): never {
 
 function unknownAnswerType(answer: never): never {
   const type: unknown = (answer as { type?: unknown }).type;
-  throw new JevResponseError(`Unknown Jev answer type ${describeLabel(type)}.`);
+  throw new JevResponseError(`Unknown Jev answer type ${describeReturned(type)}.`);
+}
+
+/** Answer types Jev can send; quoting one cannot echo chunk text. */
+const ANSWER_TYPES: readonly unknown[] = ["choice", "score", "noul"];
+
+/**
+ * Quoted, truncated rendering of a caller label (a criteria key or level) or
+ * question type for error messages.
+ */
+function describeLabel(value: unknown): string {
+  return typeof value === "string" ? quote(value) : describeKind(value);
 }
 
 /**
- * Quoted, truncated rendering of a label or answer type for error messages.
- * Labels come from the caller's criteria or Jev's option selection, never
- * from chunk text.
+ * A string Jev returned that is neither a caller label nor an answer type
+ * (spec 16): Jev may have copied it from the chunk text, so only its length
+ * is shown.
  */
-function describeLabel(value: unknown): string {
-  if (typeof value !== "string") return describeKind(value);
-  const shown = value.length > MAX_ECHO_LENGTH ? `${value.slice(0, MAX_ECHO_LENGTH)}…` : value;
-  return JSON.stringify(shown);
+function describeReturned(value: unknown): string {
+  return typeof value === "string" ? `a string of length ${value.length}` : describeKind(value);
+}
+
+function describeAnswerType(value: unknown): string {
+  return ANSWER_TYPES.includes(value) ? describeLabel(value) : describeReturned(value);
 }
 
 /** Numbers and booleans as-is; anything else by kind only (string content is never echoed). */

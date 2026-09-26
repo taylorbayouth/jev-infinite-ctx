@@ -16,6 +16,7 @@ import {
   MIN_STATE_TOKENS,
 } from "./defaults.js";
 import { JevValidationError } from "./errors.js";
+import { quote } from "./internal.js";
 import type {
   AggregationMethod,
   BuiltInTransportName,
@@ -94,9 +95,6 @@ const BUILT_IN_TRANSPORTS: readonly BuiltInTransportName[] = ["openrouter", "dir
 
 /** Upper bound for chunking.contextSafetyReserve (types.ts: range [0, 0.5]). */
 const MAX_CONTEXT_SAFETY_RESERVE = 0.5;
-
-/** Longest string echoed back in an error message. */
-const MAX_ECHO_LENGTH = 64;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -343,7 +341,7 @@ function checkNoulCriteria(criteria: unknown): void {
   const keys = Object.keys(criteria);
   if (keys.length !== 2 || !Object.hasOwn(criteria, "true") || !Object.hasOwn(criteria, "false")) {
     fail(
-      `question.criteria must have exactly the keys "true" and "false" for a "noul" question, got ${keys.map((k) => JSON.stringify(truncate(k))).join(", ") || "no keys"}.`,
+      `question.criteria must have exactly the keys "true" and "false" for a "noul" question, got ${keys.map((k) => quote(k)).join(", ") || "no keys"}.`,
     );
   }
   checkCriterion(criteria["true"], "question.criteria.true");
@@ -599,16 +597,12 @@ function pathSegment(key: string, root = false): string {
   if (/^[A-Za-z_$][\w$]*$/.test(key)) {
     return root ? key : `.${key}`;
   }
-  return `[${JSON.stringify(truncate(key))}]`;
+  return `[${quote(key)}]`;
 }
 
 /** Uses a regex instead of trim() so a multi-megabyte input is not copied. */
 function hasNonWhitespace(text: string): boolean {
   return /\S/.test(text);
-}
-
-function truncate(text: string): string {
-  return text.length > MAX_ECHO_LENGTH ? `${text.slice(0, MAX_ECHO_LENGTH)}...` : text;
 }
 
 /** Short, safe description of an invalid value for error messages. */
@@ -621,7 +615,7 @@ function describeValue(value: unknown): string {
   }
   switch (typeof value) {
     case "string":
-      return JSON.stringify(truncate(value));
+      return quote(value);
     case "number":
     case "boolean":
     case "undefined":

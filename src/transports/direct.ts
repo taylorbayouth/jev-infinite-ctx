@@ -5,10 +5,10 @@
  */
 
 import { JevValidationError } from "../errors.js";
+import { isRecord } from "../internal.js";
 import type { JevTransport, NativeJevRequest, NativeJevResponse } from "../types.js";
 import {
   encodeDecisionBody,
-  isRecord,
   mergeHeaders,
   normalizeBaseUrl,
   postDecision,

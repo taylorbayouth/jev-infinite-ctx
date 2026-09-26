@@ -208,18 +208,21 @@ describe("toDistribution (choice)", () => {
     }
   });
 
-  it("rejects unknown probability keys, including prototype names", () => {
+  it("rejects unknown probability keys, including prototype names, naming them by length only", () => {
+    // Jev may copy an unknown key from the chunk text, so it is never quoted.
     expect(() =>
       toDistribution(TREE_ROCK, choiceAnswer("tree", { tree: 0.9, bush: 0.1 })),
-    ).toThrow(/unknown label "bush"/);
+    ).toThrow("Jev choice probabilities contain an unknown label, a string of length 4.");
     const protoKey = Object.fromEntries([
       ["tree", 0.9],
       ["__proto__", 0.1],
     ]);
-    expect(() => toDistribution(TREE_ROCK, choiceAnswer("tree", protoKey))).toThrow(/"__proto__"/);
+    expect(() => toDistribution(TREE_ROCK, choiceAnswer("tree", protoKey))).toThrow(
+      /unknown label, a string of length 9\./,
+    );
     expect(() =>
       toDistribution(TREE_ROCK, choiceAnswer("tree", { tree: 0.9, toString: 0.1 })),
-    ).toThrow(/unknown label "toString"/);
+    ).toThrow(/unknown label, a string of length 8\./);
   });
 
   it("rejects a choice that is not a criteria key", () => {
@@ -428,7 +431,7 @@ describe("toDistribution (score)", () => {
   it("rejects level keys outside the rubric", () => {
     expect(() =>
       toDistribution(q, { type: "score", score: 1, probabilities: { "0": 0.5, "4": 0.5 } }),
-    ).toThrow(/unknown label "4"/);
+    ).toThrow(/unknown label, a string of length 1\./);
     expect(() =>
       toDistribution(q, { type: "score", score: 1, probabilities: { "01": 1 } }),
     ).toThrow(JevResponseError);
