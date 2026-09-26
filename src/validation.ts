@@ -109,6 +109,18 @@ const MAX_ECHO_LENGTH = 64;
  * fall back to defaults. Returns the same object, typed.
  */
 export function validateRequest(request: unknown): JevInfiniteCTXRequest {
+  return validateRequestAndResolve(request).request;
+}
+
+/**
+ * Same checks as `validateRequest`, and also returns the resolved options.
+ * Option sections are read exactly once, so callers that need both (decide)
+ * neither repeat the work nor observe a caller's option getters twice.
+ */
+export function validateRequestAndResolve(request: unknown): {
+  request: JevInfiniteCTXRequest;
+  options: ResolvedOptions;
+} {
   const req = requireObject(request, "request");
   rejectUnknownFields(req, REQUEST_FIELDS, "");
 
@@ -129,8 +141,7 @@ export function validateRequest(request: unknown): JevInfiniteCTXRequest {
   checkProvider(req["provider"]);
 
   const typed = req as unknown as JevInfiniteCTXRequest;
-  resolveOptions(typed);
-  return typed;
+  return { request: typed, options: resolveOptions(typed) };
 }
 
 /**
@@ -339,9 +350,19 @@ function checkNoulCriteria(criteria: unknown): void {
   checkCriterion(criteria["false"], "question.criteria.false");
 }
 
-/** A criterion is a string or a structured JSON object/array (types.ts JevCriterion). */
+/**
+ * A criterion is a non-empty string or a structured JSON object/array
+ * (types.ts JevCriterion). A blank string would send Jev a meaningless
+ * option or rubric level, so it is rejected like blank instructions.
+ */
 function checkCriterion(value: unknown, path: string): void {
-  if (typeof value !== "string" && (typeof value !== "object" || value === null)) {
+  if (typeof value === "string") {
+    if (!hasNonWhitespace(value)) {
+      fail(`${path} must be a non-empty string, got an empty or whitespace-only string.`);
+    }
+    return;
+  }
+  if (typeof value !== "object" || value === null) {
     fail(`${path} must be a string, an object, or an array, got ${describeValue(value)}.`);
   }
   checkSerializable(value, path);

@@ -10,6 +10,12 @@ import {
 
 const count = (text: string): number => defaultTokenizer.count(text);
 
+const AUSTEN =
+  "It is a truth universally acknowledged, that a single man in possession of a good fortune, " +
+  "must be in want of a wife. However little known the feelings or views of such a man may be on " +
+  "his first entering a neighbourhood, this truth is so well fixed in the minds of the surrounding " +
+  "families, that he is considered the rightful property of some one or other of their daughters.";
+
 /** Any code point, lone surrogate halves (which pair up when adjacent), and structural text. */
 const unit = fc.oneof(
   { weight: 4, arbitrary: fc.string({ unit: "binary", minLength: 1, maxLength: 1 }) },
@@ -20,6 +26,7 @@ const unit = fc.oneof(
     arbitrary: fc.constantFrom(
       " ", "  ", "\n", "\n\n", "\r\n", "\t", ".", "!\" ", "=>", "a", "B", "word", "Word", "camelCase",
       "123", "é", "e\u0301", "\u0301", "中", "ー", "한", "😀", "👨\u200d👩\u200d👧", "\u00a0", "\u200d", "\ufe0f",
+      "д", "न", "\u094d", "\u0947", "\u05b0", "\u1100", "\u1161", "ㅋ", "ｶ", "\uff9e", " 1", "\n  4",
     ),
   },
 );
@@ -91,6 +98,22 @@ describe("HeuristicTokenizer", () => {
       expect(count(text)).toBe(expected);
     });
 
+    // cl100k and o200k never merge a space into the digit group after it:
+    // " 1 2" is [" ", "1", " ", "2"], so that space costs a token (F03).
+    it.each([
+      [" 1", 2],
+      ["1 2 3", 5],
+      ["a 1", 3],
+      ["  1", 3], // ceil(2 / 4) + 1 + 1
+      ["\t 1", 3],
+      ["\n1", 2], // a run ending in a line break already costs its token
+      ["1 ", 1], // nothing follows the space
+      ["1 a", 2], // a space before a letter is still free
+      ["1\u00a02", 3], // a no-break space costs its usual 1, with no extra token
+    ])("whitespace before a digit %j → %i", (text, expected) => {
+      expect(count(text)).toBe(expected);
+    });
+
     it.each([
       [".", 1],
       ["=>", 1],
@@ -122,8 +145,20 @@ describe("HeuristicTokenizer", () => {
     it.each([
       ["привет", 3],
       ["Ελλάδα", 3],
-      ["नमस्ते", 3], // letters and vowel signs form one run of 6 code units
+      // 4 letters (2) plus a virama and a vowel sign (1 each); o200k 4, cl100k 6.
+      ["नमस्ते", 4],
+      ["д\u0301\u0302\u0303", 4], // a mark costs 1 in a run, as it does when stray
     ])("other scripts %j → %i", (text, expected) => {
+      expect(count(text)).toBe(expected);
+    });
+
+    it.each([
+      ["ｶ", 2], // halfwidth Katakana
+      ["ﾃﾞ", 4], // halfwidth Katakana and its voiced sound mark
+      ["ㅋ", 2], // compatibility Jamo
+      ["한".normalize("NFD"), 6], // three conjoining Jamo
+      ["한", 2], // the composed syllable stays ceil(1.25)
+    ])("Jamo and halfwidth forms %j → %i", (text, expected) => {
       expect(count(text)).toBe(expected);
     });
 
@@ -239,6 +274,53 @@ describe("HeuristicTokenizer", () => {
         cl100k: 95,
         o200k: 93,
       },
+      {
+        name: "English prose (Austen)",
+        text: AUSTEN,
+        cl100k: 76,
+        o200k: 76,
+      },
+      // Numeric text: every space before a digit is its own token (F03).
+      { name: "a lone space before a digit", text: " 1", cl100k: 2, o200k: 2 },
+      {
+        name: "space-separated integers",
+        text: Array.from({ length: 100 }, (_, i) => String((i * 37) % 1000)).join(" "),
+        cl100k: 199,
+        o200k: 199,
+      },
+      {
+        name: "comma-separated list",
+        text: Array.from({ length: 100 }, (_, i) => String((i * 7) % 100)).join(", "),
+        cl100k: 298,
+        o200k: 298,
+      },
+      {
+        name: "space-separated decimals",
+        text: Array.from(
+          { length: 50 },
+          (_, i) => `${(i * 13) % 100}.${String((i * 29) % 100).padStart(2, "0")}`,
+        ).join(" "),
+        cl100k: 199,
+        o200k: 199,
+      },
+      {
+        name: "space-aligned numeric table",
+        text: Array.from({ length: 10 }, (_, r) =>
+          Array.from({ length: 5 }, (_, c) => String((r * 7919 + c * 104729) % 100000).padStart(6)).join(" "),
+        ).join("\n"),
+        cl100k: 200,
+        o200k: 200,
+      },
+      {
+        name: "log lines with timestamps and counts",
+        text: Array.from(
+          { length: 30 },
+          (_, i) =>
+            `2026-09-25 12:${String(i % 60).padStart(2, "0")}:07 INFO worker ${i % 7} processed ${i * 131} items in ${(i * 17) % 900} ms`,
+        ).join("\n"),
+        cl100k: 771,
+        o200k: 771,
+      },
     ];
 
     it.each(samples)("does not under-estimate $name", ({ text, cl100k, o200k }) => {
@@ -248,11 +330,47 @@ describe("HeuristicTokenizer", () => {
       expect(estimate).toBeLessThanOrEqual(reference * 1.75);
     });
 
-    it("estimates English prose at roughly 3.2-4 characters per token", () => {
-      const prose = samples[0]!.text;
+    it.each([samples[0]!.text, AUSTEN])("estimates English prose at roughly 3.2-4 characters per token", (prose) => {
       const charsPerToken = prose.length / count(prose);
       expect(charsPerToken).toBeGreaterThanOrEqual(3.2);
       expect(charsPerToken).toBeLessThanOrEqual(4.2);
+    });
+
+    // Scripts whose letters cl100k splits finely stay at or above o200k.
+    it.each([
+      ["Russian", "Привет, мир! Это простое предложение на русском языке для проверки количества токенов.", 36, 19],
+      ["Greek", "Γεια σου κόσμε! Αυτή είναι μια απλή πρόταση στα ελληνικά για τον έλεγχο των διακριτικών.", 76, 27],
+      ["Hindi", "नमस्ते दुनिया। भारत एक विशाल देश है जिसमें अनेक भाषाएँ बोली जाती हैं और यहाँ की संस्कृति बहुत पुरानी है।", 105, 28],
+      ["Thai", "สวัสดีชาวโลก ภาษาไทยเป็นภาษาที่มีวรรณยุกต์และสระที่ซับซ้อน", 61, 27],
+      ["Arabic", "مرحبا بالعالم هذه جملة عربية بسيطة لاختبار عدد الرموز في النص", 44, 17],
+    ])("estimates %s at or above o200k", (_name, text, cl100k, o200k) => {
+      const estimate = count(text);
+      expect(estimate).toBeGreaterThanOrEqual(o200k);
+      expect(estimate).toBeLessThanOrEqual(cl100k * 1.75);
+    });
+
+    // The documented known low estimates (src/tokenizer.ts) stay within their
+    // documented margins; this pins the documentation to the code.
+    it.each([
+      [
+        "a DNA sequence (random letter run)",
+        ">seq1\nGATTACACCGTAGCTAGGCTTACGATCGGATCCATGCAAGTCGTACGATGCTAGCTTAGCA\n" +
+          "TTGACCGATGCATCGATCGGCTAGCTAACGTTAGCATGCGATCGTAGCTAGGCATCGATGC\n",
+        70,
+        0.4,
+      ],
+      ["NFD Hangul", "안녕하세요 세계".normalize("NFD"), 49, 0.6],
+      ["halfwidth Katakana", "ｺﾝﾆﾁﾊ ｾｶｲ ﾃﾞｽ ｶﾞｯｺｳ ﾆ ｲｷﾏｽ", 47, 0.85],
+      ["pointed Hebrew (vs o200k)", "בְּרֵאשִׁית בָּרָא אֱלֹהִים אֵת הַשָּׁמַיִם וְאֵת הָאָרֶץ", 48, 0.75],
+      ["NFD Vietnamese (vs o200k)", "Tiếng Việt là ngôn ngữ chính thức của Việt Nam".normalize("NFD"), 33, 0.7],
+      [
+        "numbers indented by two spaces",
+        Array.from({ length: 200 }, (_, i) => "  " + String(i * 37)).join("\n"),
+        971,
+        0.75,
+      ],
+    ])("keeps the known low estimate for %s within its documented margin", (_name, text, reference, ratio) => {
+      expect(count(text)).toBeGreaterThanOrEqual(Math.floor(reference * ratio));
     });
   });
 
@@ -268,6 +386,13 @@ describe("HeuristicTokenizer", () => {
         }),
         { numRuns: 500 },
       );
+    });
+
+    it("is monotone for combining marks after an other-script letter", () => {
+      const marks = "\u0301\u0302\u0303";
+      expect(count(marks)).toBe(3); // stray marks cost 1 each
+      expect(count("д" + marks)).toBeGreaterThanOrEqual(count(marks));
+      expect(count("न" + "\u094d\u0947")).toBeGreaterThanOrEqual(count("\u094d\u0947"));
     });
 
     it("is monotone: a substring never counts more than the string containing it", () => {

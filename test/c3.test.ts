@@ -54,17 +54,26 @@ describe("effectiveChunkCount", () => {
     expect(effectiveChunkCount(chunks)).toBe(7);
   });
 
-  it("uses each chunk's actual unique fraction (short final chunk)", () => {
+  it("measures new content in units of the largest chunk (short final chunk)", () => {
     const chunks = [
       { tokens: 1000, uniqueTokens: 1000 },
       { tokens: 1000, uniqueTokens: 950 },
       { tokens: 200, uniqueTokens: 150 },
     ];
-    // 1 + 0.95 + 0.75
-    expect(effectiveChunkCount(chunks)).toBeCloseTo(2.7, 12);
+    // (1000 + 950 + 150) / 1000
+    expect(effectiveChunkCount(chunks)).toBeCloseTo(2.1, 12);
   });
 
-  it("ignores the first chunk's counts and treats tokens < 1 as 1", () => {
+  it("counts a tiny chunk as its share of a full chunk, not as a whole one (overlap 0)", () => {
+    const full = { tokens: 1000, uniqueTokens: 1000 };
+    const tiny = { tokens: 10, uniqueTokens: 10 };
+    expect(effectiveChunkCount([full, tiny])).toBeCloseTo(1.01, 12);
+    expect(effectiveChunkCount([tiny, full])).toBeCloseTo(1.01, 12);
+    // README: a short final chunk adds less than a full one.
+    expect(effectiveChunkCount([full, tiny])).toBeLessThan(effectiveChunkCount([full, full]));
+  });
+
+  it("treats tokens < 1 as 1", () => {
     expect(
       effectiveChunkCount([
         { tokens: 0, uniqueTokens: 1 },
@@ -73,8 +82,7 @@ describe("effectiveChunkCount", () => {
     ).toBe(2);
   });
 
-  it("caps each chunk's contribution at one chunk", () => {
-    // Inconsistent input (unique > tokens) must not push N_eff above N.
+  it("never exceeds N, even for inconsistent input (unique > tokens)", () => {
     expect(
       effectiveChunkCount([
         { tokens: 10, uniqueTokens: 10 },
@@ -91,8 +99,11 @@ describe("effectiveChunkCount", () => {
     [{ tokens: Number.NaN, uniqueTokens: 1 }],
     [{ tokens: 10, uniqueTokens: -1 }],
     [{ tokens: Number.POSITIVE_INFINITY, uniqueTokens: 1 }],
-  ])("rejects invalid token counts %j", (bad) => {
+  ])("rejects invalid token counts %j, in any chunk", (bad) => {
     expect(() => effectiveChunkCount([{ tokens: 10, uniqueTokens: 10 }, bad])).toThrow(
+      JevInfiniteCTXError,
+    );
+    expect(() => effectiveChunkCount([bad, { tokens: 10, uniqueTokens: 10 }])).toThrow(
       JevInfiniteCTXError,
     );
   });

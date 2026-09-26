@@ -38,13 +38,17 @@ const RETRYABLE_KINDS: ReadonlySet<ProviderErrorKind> = new Set([
 
 export interface JevProviderErrorOptions {
   kind: ProviderErrorKind;
-  status?: number;
+  status?: number | undefined;
   /** Server-requested delay (for example from Retry-After), in milliseconds. */
-  retryAfterMs?: number;
+  retryAfterMs?: number | undefined;
   /** Overrides the default retryability derived from `kind`. */
-  retryable?: boolean;
-  /** Provider response body, truncated. Never contains request state. */
-  body?: string;
+  retryable?: boolean | undefined;
+  /**
+   * Provider response body, truncated. Built-in transports redact echoes of
+   * the request state on a best-effort basis (every shared run of 8 or more
+   * characters, including JSON-escaped ones).
+   */
+  body?: string | undefined;
   cause?: unknown;
 }
 

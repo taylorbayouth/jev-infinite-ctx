@@ -1,6 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import fc from "fast-check";
+import { effectiveChunkCount } from "../src/c3.js";
 import { computeStateBudget, planChunks } from "../src/chunking.js";
+import { decide } from "../src/decide.js";
 import {
   DEFAULTS,
   FALLBACK_CONTEXT_WINDOW,
@@ -8,9 +10,10 @@ import {
   MAX_OVERLAP,
   MIN_STATE_TOKENS,
 } from "../src/defaults.js";
-import { JevValidationError } from "../src/errors.js";
+import { JevAbortError, JevInfiniteCTXError, JevValidationError } from "../src/errors.js";
 import { createTokenizer, defaultTokenizer } from "../src/tokenizer.js";
-import type { ChunkPlan, JevQuestion, ResolvedOptions, Tokenizer } from "../src/types.js";
+import type { ChunkPlan, JevQuestion, NoulQuestion, ResolvedOptions, Tokenizer } from "../src/types.js";
+import { MockTransport } from "./helpers/mock-transport.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -69,7 +72,6 @@ function expectValidPlan(input: string, result: ChunkPlan, budget: number, overl
   let previousEnd = 0;
   let weightSum = 0;
   let uniqueSum = 0;
-  let effectiveCount = 1;
   chunks.forEach((chunk, i) => {
     expect(chunk.index).toBe(i);
     expect(chunk.boundary === "end").toBe(i === chunks.length - 1);
@@ -87,7 +89,6 @@ function expectValidPlan(input: string, result: ChunkPlan, budget: number, overl
       if (overlap === 0) expect(chunk.start).toBe(previous.end);
       const shared = chunk.start === previous.end ? 0 : tokenizer.count(input.slice(chunk.start, previous.end));
       expect(chunk.overlapTokens).toBe(shared);
-      effectiveCount += chunk.uniqueTokens / Math.max(1, chunk.tokens);
     }
     expect(chunk.uniqueTokens).toBe(Math.max(1, chunk.tokens - chunk.overlapTokens));
     expect(chunk.weight).toBeGreaterThan(0);
@@ -100,7 +101,20 @@ function expectValidPlan(input: string, result: ChunkPlan, budget: number, overl
   expect(rebuilt).toBe(input);
   expect(Math.abs(weightSum - 1)).toBeLessThanOrEqual(1e-9);
   for (const chunk of chunks) expect(chunk.weight).toBeCloseTo(chunk.uniqueTokens / uniqueSum, 12);
-  expect(result.effectiveCount).toBeCloseTo(effectiveCount, 9);
+  // One N_eff implementation (spec 11.3): the plan reports exactly what C3 computes.
+  expect(result.effectiveCount).toBe(effectiveChunkCount(chunks));
+  expect(result.effectiveCount).toBeGreaterThanOrEqual(1);
+  expect(result.effectiveCount).toBeLessThanOrEqual(chunks.length);
+}
+
+/** The error `fn` throws; fails the test if it returns. */
+function caught(fn: () => unknown): unknown {
+  try {
+    fn();
+  } catch (error) {
+    return error;
+  }
+  return expect.unreachable("expected an error");
 }
 
 /** Deterministic PRNG (mulberry32). */
@@ -200,7 +214,7 @@ describe("computeStateBudget", () => {
     expect(budget.usableStateTokens).toBeGreaterThan(FALLBACK_MAX_STATE_TOKENS);
   });
 
-  it.each([undefined, Number.NaN, Number.POSITIVE_INFINITY, 0, -5])(
+  it.each([undefined, Number.NaN, Number.POSITIVE_INFINITY, 0, -5, Number.MAX_VALUE, 1e20, 2 ** 53 + 2])(
     "falls back to a conservative ~28K budget when the window is %s",
     (contextWindow) => {
       const budget = computeStateBudget({ question, contextWindow, tokenizer: defaultTokenizer, chunking });
@@ -211,6 +225,19 @@ describe("computeStateBudget", () => {
       expect(budget.usableStateTokens).toBe(FALLBACK_MAX_STATE_TOKENS);
     },
   );
+
+  it("returns a safe-integer budget for the largest window it trusts", () => {
+    const budget = computeStateBudget({
+      question,
+      contextWindow: Number.MAX_SAFE_INTEGER,
+      tokenizer: defaultTokenizer,
+      chunking,
+    });
+    expect(budget.source).toBe("metadata");
+    expect(budget.contextWindow).toBe(Number.MAX_SAFE_INTEGER);
+    expect(Number.isSafeInteger(budget.usableStateTokens)).toBe(true);
+    expect(budget.usableStateTokens).toBeGreaterThan(FALLBACK_MAX_STATE_TOKENS);
+  });
 
   it("keeps the smaller computed budget when the fallback window leaves less than the cap", () => {
     const zero = createTokenizer(() => 0);
@@ -301,6 +328,20 @@ describe("computeStateBudget", () => {
       /Tokenizer "nan" returned NaN/,
     );
   });
+
+  it("wraps an exception from the tokenizer in a JevValidationError", () => {
+    const failure = new TypeError("boom");
+    const tokenizer: Tokenizer = {
+      name: "throws",
+      count: () => {
+        throw failure;
+      },
+    };
+    const error = caught(() => computeStateBudget({ question, contextWindow: 32_000, tokenizer, chunking }));
+    expect(error).toBeInstanceOf(JevValidationError);
+    expect((error as Error).message).toBe('Tokenizer "throws" threw while counting tokens');
+    expect((error as Error).cause).toBe(failure);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -345,7 +386,10 @@ describe("planChunks", () => {
       [30, 35, "end"],
     ]);
     expect(result.chunks.map((c) => c.weight)).toEqual([10 / 35, 10 / 35, 10 / 35, 5 / 35]);
-    expect(result.effectiveCount).toBe(4);
+    // The N_eff formula itself is pinned in test/c3.test.ts.
+    expect(result.effectiveCount).toBe(effectiveChunkCount(result.chunks));
+    expect(result.effectiveCount).toBeGreaterThan(3);
+    expect(result.effectiveCount).toBeLessThanOrEqual(4);
   });
 
   it("slides the window back by the overlap target (spec 6.3)", () => {
@@ -359,7 +403,10 @@ describe("planChunks", () => {
     ]);
     // Unique tokens tile the input exactly, so overlap earns no extra weight (spec 6.4).
     expect(result.chunks.map((c) => c.weight)).toEqual([10 / 30, 8 / 30, 8 / 30, 4 / 30]);
-    expect(result.effectiveCount).toBeCloseTo(1 + 0.8 + 0.8 + 4 / 6, 12);
+    // Overlap is discounted: N_eff < N. The formula itself is pinned in test/c3.test.ts.
+    expect(result.effectiveCount).toBe(effectiveChunkCount(result.chunks));
+    expect(result.effectiveCount).toBeGreaterThan(1);
+    expect(result.effectiveCount).toBeLessThan(4);
   });
 
   it("gives N_eff = 1 + (N − 1)(1 − r) for uniform chunks (spec 11.3)", () => {
@@ -372,6 +419,14 @@ describe("planChunks", () => {
       [360, 460],
     ]);
     expect(result.effectiveCount).toBeCloseTo(1 + 4 * 0.9, 12);
+  });
+
+  it("counts a tiny final chunk in N_eff by its share of new content, not as a whole chunk", () => {
+    const result = plan("x".repeat(1000) + "y".repeat(10), 1000, { preferNaturalBoundaries: false });
+    expect(result.chunks.map((c) => c.tokens)).toEqual([1000, 10]);
+    // The tail carries ~1% of the weight, and adds ~1% of a chunk to N_eff.
+    expect(result.chunks[1]?.weight).toBeCloseTo(10 / 1010, 12);
+    expect(result.effectiveCount).toBeCloseTo(1.01, 12);
   });
 
   it("uses no overlap when floor(budget × overlap) is zero", () => {
@@ -608,6 +663,44 @@ describe("planChunks", () => {
       expect(() => planChunks("text", { ...valid, tokenizer })).toThrow(/Tokenizer "raw" returned -1/);
     });
 
+    it("wraps an exception from the tokenizer, keeping it only as the cause", () => {
+      const failure = new TypeError("boom");
+      const tokenizer: Tokenizer = {
+        name: "raw",
+        count: () => {
+          throw failure;
+        },
+      };
+      const error = caught(() => planChunks("secret source text", { ...valid, tokenizer }));
+      expect(error).toBeInstanceOf(JevValidationError);
+      expect((error as Error).cause).toBe(failure);
+      expect((error as Error).message).toBe('Tokenizer "raw" threw while counting tokens');
+      expect((error as Error).message).not.toContain("secret");
+    });
+
+    it("wraps a createTokenizer tokenizer that throws partway through planning", () => {
+      // Mimics js-tiktoken's default encode, which throws on special tokens.
+      const tokenizer = createTokenizer((text) => {
+        if (text.includes("<|endoftext|>")) throw new Error("disallowed special token");
+        return text.length;
+      }, "o200k_base");
+      const input = "a".repeat(300) + "<|endoftext|>" + "b".repeat(300);
+      const error = caught(() => planChunks(input, { ...valid, tokenizer }));
+      expect(error).toBeInstanceOf(JevValidationError);
+      expect((error as Error).message).toMatch(/Tokenizer "o200k_base" threw/);
+    });
+
+    it("rethrows a JevInfiniteCTXError from the tokenizer unchanged", () => {
+      const abort = new JevAbortError("aborted");
+      const tokenizer: Tokenizer = {
+        name: "aborts",
+        count: () => {
+          throw abort;
+        },
+      };
+      expect(caught(() => planChunks("text", { ...valid, tokenizer }))).toBe(abort);
+    });
+
     it("reports a character that alone exceeds the budget, without leaking text", () => {
       expect(() => plan("😀", 1)).toThrow(/cannot hold the single character at offset 0/);
       try {
@@ -695,6 +788,33 @@ describe("planChunks", () => {
       );
     });
 
+    it("reports exactly the N_eff that C3 computes, for any tokenizer", () => {
+      // Non-monotone-ish: whitespace-only text counts as 0 tokens.
+      const zeroWhitespace = createTokenizer((text) => (text.trim() === "" ? 0 : Math.ceil(text.length / 3)), "zero-ws");
+      const words = createTokenizer((text) => (text.match(/\S+/g) ?? []).length, "words");
+      fc.assert(
+        fc.property(
+          fc.string({ maxLength: 600, unit: fc.constantFrom("a", "b", " ", ".", "\n", "é", "😀") }),
+          fc.integer({ min: 4, max: 60 }),
+          overlapRatio,
+          fc.constantFrom(words, charTokenizer, zeroWhitespace),
+          fc.boolean(),
+          (text, budget, overlap, tokenizer, preferNaturalBoundaries) => {
+            let result: ChunkPlan;
+            try {
+              result = plan(text, budget, { overlap, preferNaturalBoundaries, tokenizer });
+            } catch (error) {
+              // A single character larger than the budget is the only expected failure.
+              expect(error).toBeInstanceOf(JevValidationError);
+              return;
+            }
+            expect(result.effectiveCount).toBe(effectiveChunkCount(result.chunks));
+          },
+        ),
+        { numRuns: 500 },
+      );
+    });
+
     it("labels boundaries truthfully and cuts hard only when the window has no break", () => {
       fc.assert(
         fc.property(arbitraryText, fc.integer({ min: 4, max: 40 }), overlapRatio, (text, budget, overlap) => {
@@ -774,6 +894,40 @@ describe("planChunks", () => {
       expect(large).toBeLessThan(small * 1.5);
     });
 
+    const timedPlan = (text: string, preferNaturalBoundaries: boolean): { ms: number; result: ChunkPlan } => {
+      const started = performance.now();
+      const result = plan(text, MIN_STATE_TOKENS, { overlap: 0.05, tokenizer: defaultTokenizer, preferNaturalBoundaries });
+      return { ms: performance.now() - started, result };
+    };
+
+    it("plans 2,000,000 spaces in well under 5 s: natural-boundary search stays linear", () => {
+      const spaces = " ".repeat(2_000_000);
+      const { ms, result } = timedPlan(spaces, true);
+      expect(result.chunks[result.chunks.length - 1]!.end).toBe(spaces.length);
+      expect(ms).toBeLessThan(2500);
+    }, 60_000);
+
+    it.each([
+      ["tabs", "\t"],
+      ["carriage returns", "\r"],
+      ["ideographic spaces", "\u3000"],
+    ])("adds only a constant factor for natural boundaries on 1,000,000 %s", (_label, ch) => {
+      const text = ch.repeat(1_000_000);
+      const off = timedPlan(text, false).ms;
+      const on = timedPlan(text, true).ms;
+      // Prose costs ~2x with natural boundaries on; a quadratic walk cost 50-90x here.
+      expect(on).toBeLessThan(Math.max(off, 25) * 10);
+    }, 60_000);
+
+    it("labels a chunk a sentence end only when its terminator lies inside the chunk", () => {
+      const text = "End." + " ".repeat(200_000) + "tail";
+      const { result } = timedPlan(text, true);
+      expect(result.chunks[0]).toMatchObject({ start: 0, boundary: "sentence" });
+      const deep = result.chunks.filter((chunk) => chunk.start > 10_000 && chunk.end < text.length - 10);
+      expect(deep.length).toBeGreaterThan(0);
+      for (const chunk of deep) expect(chunk.boundary).toBe("whitespace");
+    }, 60_000);
+
     it("processes a 100K+ token input into multiple chunks without truncation (spec 18)", () => {
       const text = englishText(450_000, 12);
       const totalTokens = defaultTokenizer.count(text);
@@ -786,5 +940,101 @@ describe("planChunks", () => {
       expect(result.effectiveCount).toBeGreaterThan(1);
       expect(result.effectiveCount).toBeLessThan(result.chunks.length);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// decide() integration: budgeting and planning errors reach the caller typed
+// ---------------------------------------------------------------------------
+
+describe("decide() with chunking edge cases", () => {
+  const NOUL: NoulQuestion = { type: "noul", instructions: "Does the document mention a data breach?" };
+
+  /** Mimics js-tiktoken's default `encode`, which throws on disallowed special tokens. */
+  const tiktokenLike = (): Tokenizer =>
+    createTokenizer((text) => {
+      if (text.includes("<|endoftext|>")) {
+        throw new Error("The text contains a special token that is not allowed: <|endoftext|>");
+      }
+      return defaultTokenizer.count(text);
+    }, "o200k_base");
+
+  async function rejectionOf(promise: Promise<unknown>): Promise<unknown> {
+    try {
+      await promise;
+    } catch (error) {
+      return error;
+    }
+    return expect.unreachable("expected a rejection");
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("rejects with a JevValidationError when the tokenizer throws while planning chunks", async () => {
+    const mock = new MockTransport();
+    const error = await rejectionOf(
+      decide({
+        input: "Quarterly report.\n\n<|endoftext|>\n\nNo incidents.",
+        question: NOUL,
+        tokenizer: tiktokenLike(),
+        provider: { transport: mock },
+      }),
+    );
+    expect(mock.requests.length).toBe(0);
+    expect(error).toBeInstanceOf(JevInfiniteCTXError);
+    expect(error).toBeInstanceOf(JevValidationError);
+    expect((error as Error).cause).toBeInstanceOf(Error);
+  });
+
+  it("rejects with a JevValidationError when the tokenizer throws while budgeting the question", async () => {
+    const mock = new MockTransport();
+    const error = await rejectionOf(
+      decide({
+        input: "Quarterly report.",
+        question: { type: "noul", instructions: "Treat <|endoftext|> as a breach marker." },
+        tokenizer: tiktokenLike(),
+        provider: { transport: mock },
+      }),
+    );
+    expect(mock.requests.length).toBe(0);
+    expect(error).toBeInstanceOf(JevValidationError);
+  });
+
+  it.each([
+    ["Number.MAX_VALUE", Number.MAX_VALUE],
+    ["1e20", 1e20],
+  ])("succeeds when a custom transport reports a %s context window", async (_label, window) => {
+    const mock = new MockTransport({ contextWindow: window });
+    const result = await decide({ input: "An oak grows here.", question: NOUL, provider: { transport: mock } });
+    expect(result.type).toBe("noul");
+    expect(Number.isSafeInteger(result.chunks.stateTokenBudget)).toBe(true);
+  });
+
+  it("succeeds when the OpenRouter catalog reports context_length 1e20", async () => {
+    const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      if (String(url).includes("/api/v1/models")) {
+        return Response.json({
+          data: [{ id: "typesafe/jev-1.13", canonical_slug: "typesafe/jev-1.13-20260917", context_length: 1e20 }],
+        });
+      }
+      const body = JSON.parse(String(init?.body)) as { state: string };
+      return Response.json({
+        id: "gen-dec-1",
+        model: "typesafe/jev-1.13-20260917",
+        provider: "TypeSafe",
+        answers: { decision: { type: "noul", noul: body.state.includes("oak") ? 0.8 : 0.2 } },
+        usage: { input_tokens: 40, output_tokens: 3, cost: 0.0002 },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await decide({
+      input: "An oak grows here.",
+      question: NOUL,
+      provider: { transport: "openrouter", apiKey: "sk-or-test" },
+    });
+    expect(result).toMatchObject({ type: "noul", noul: 0.8 });
   });
 });

@@ -11,9 +11,9 @@ import type { ChunkResult, JevInfiniteCTXResult, JsonObject } from "./types.js";
 
 export interface SerializeOptions {
   /** Include `chunks.results`. Default true. The other `chunks` fields are always kept. */
-  includeChunkResults?: boolean;
+  includeChunkResults?: boolean | undefined;
   /** Include each chunk result's raw Jev `answer`. Default true. Irrelevant when chunk results are excluded. */
-  includeRawAnswers?: boolean;
+  includeRawAnswers?: boolean | undefined;
 }
 
 /**

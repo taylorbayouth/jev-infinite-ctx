@@ -7,6 +7,7 @@
  * neighbouring chunks overlap by about floor(budget × overlap) tokens.
  */
 
+import { effectiveChunkCount } from "./c3.js";
 import {
   FALLBACK_CONTEXT_WINDOW,
   FALLBACK_MAX_STATE_TOKENS,
@@ -42,8 +43,9 @@ const MIN_GALLOP_STEP = 16;
  * Computes the per-chunk state budget:
  * usable = window − questionTokens − protocolReserve − safetyReserve, where
  * safetyReserve = ceil(contextSafetyReserve × remaining). An unknown window
- * falls back to FALLBACK_CONTEXT_WINDOW and is capped at
- * FALLBACK_MAX_STATE_TOKENS; a numeric `maxStateTokens` caps the result.
+ * (not a finite number in (0, Number.MAX_SAFE_INTEGER]) falls back to
+ * FALLBACK_CONTEXT_WINDOW and is capped at FALLBACK_MAX_STATE_TOKENS; a
+ * numeric `maxStateTokens` caps the result.
  * Throws JevValidationError when fewer than MIN_STATE_TOKENS remain.
  */
 export function computeStateBudget(args: {
@@ -65,10 +67,15 @@ export function computeStateBudget(args: {
   } catch (error) {
     throw new JevValidationError("question must be JSON-serializable", { cause: error });
   }
-  const questionTokens = normalizeTokenCount(tokenizer.count(serialized), tokenizer.name);
+  const questionTokens = countTokens(tokenizer, serialized);
 
+  // Metadata is advisory: a window beyond MAX_SAFE_INTEGER (e.g. a bogus
+  // catalog entry) is treated as unknown, so the budget stays a safe integer.
   const windowKnown =
-    typeof contextWindow === "number" && Number.isFinite(contextWindow) && contextWindow > 0;
+    typeof contextWindow === "number" &&
+    Number.isFinite(contextWindow) &&
+    contextWindow > 0 &&
+    contextWindow <= Number.MAX_SAFE_INTEGER;
   const window = windowKnown ? contextWindow : FALLBACK_CONTEXT_WINDOW;
   const remaining = window - questionTokens - chunking.protocolReserve;
   const safetyReserve = Math.ceil(Math.max(0, remaining) * chunking.contextSafetyReserve);
@@ -122,7 +129,8 @@ export function computeStateBudget(args: {
  *
  * `stateTokenBudget` may be any positive integer (the orchestrator never goes
  * below MIN_STATE_TOKENS); a JevValidationError is thrown if the tokenizer
- * reports a single character as larger than the budget.
+ * reports a single character as larger than the budget, returns an invalid
+ * count, or throws.
  */
 export function planChunks(
   input: string,
@@ -149,7 +157,7 @@ export function planChunks(
   }
   assertTokenizer(tokenizer, "planChunks: tokenizer");
 
-  const count = (text: string): number => normalizeTokenCount(tokenizer.count(text), tokenizer.name);
+  const count = (text: string): number => countTokens(tokenizer, text);
   const totalTokens = count(input);
   // Always < budget because overlap <= 0.5, which leaves room for new content.
   const overlapTarget = Math.floor(budget * overlap);
@@ -170,12 +178,7 @@ export function planChunks(
     boundary: span.boundary,
   }));
   const uniqueSum = chunks.reduce((sum, chunk) => sum + chunk.uniqueTokens, 0);
-  let effectiveCount = 1;
-  for (const chunk of chunks) {
-    chunk.weight = chunk.uniqueTokens / uniqueSum;
-    // N_eff = 1 + Σ_{i≥1} unique_i / tokens_i (spec 11.3).
-    if (chunk.index > 0) effectiveCount += chunk.uniqueTokens / Math.max(1, chunk.tokens);
-  }
+  for (const chunk of chunks) chunk.weight = chunk.uniqueTokens / uniqueSum;
 
   return {
     chunks,
@@ -183,7 +186,8 @@ export function planChunks(
     overlapTokens: overlapTarget,
     overlapRatio: overlap,
     totalTokens,
-    effectiveCount,
+    // One implementation of spec 11.3, shared with C3 and decide().
+    effectiveCount: effectiveChunkCount(chunks),
   };
 }
 
@@ -581,11 +585,19 @@ function isCloser(code: number): boolean {
   }
 }
 
-/** Whether the text before `pos` ends with a terminator plus optional closers. */
-function endsWithTerminator(input: string, pos: number, terminator: (code: number) => boolean): boolean {
+/**
+ * Whether [min, pos) ends with a terminator plus optional closers. Nothing
+ * before `min` (the chunk start) is examined, so the walk stays in the chunk.
+ */
+function endsWithTerminator(
+  input: string,
+  min: number,
+  pos: number,
+  terminator: (code: number) => boolean,
+): boolean {
   let k = pos - 1;
-  while (k >= 0 && isCloser(input.charCodeAt(k))) k--;
-  return k >= 0 && terminator(input.charCodeAt(k));
+  while (k >= min && isCloser(input.charCodeAt(k))) k--;
+  return k >= min && terminator(input.charCodeAt(k));
 }
 
 /**
@@ -608,7 +620,7 @@ function findNaturalBoundary(
   );
   let end = lastParagraphEnd(input, lowest, maxEnd);
   if (end >= 0) return { end, kind: "paragraph" };
-  end = lastSentenceEnd(input, lowest, maxEnd);
+  end = lastSentenceEnd(input, start, lowest, maxEnd);
   if (end >= 0) return { end, kind: "sentence" };
   end = lastWhitespaceEnd(input, lowest, maxEnd);
   if (end >= 0) return { end, kind: "whitespace" };
@@ -633,16 +645,19 @@ function lastParagraphEnd(input: string, lowest: number, highest: number): numbe
  * the end of the whitespace after a terminator and optional closers; also
  * accepted is the position right after the closers, when whitespace follows
  * (reachable only at `highest`, when that whitespace does not fit) or when
- * the terminator is a CJK one. Each run is examined once, so the scan is
- * linear in the window.
+ * the terminator is a CJK one. The terminator must lie in the chunk, at or
+ * after `start`: backward walks over whitespace and closers stop there, so
+ * a run is examined once and the scan is linear in [start, highest] (a long
+ * blank region costs O(n) over the whole plan, not O(n²)).
  */
-function lastSentenceEnd(input: string, lowest: number, highest: number): number {
+function lastSentenceEnd(input: string, start: number, lowest: number, highest: number): number {
   let e = highest;
   while (e >= lowest) {
     if (isBreakingSpace(input.charCodeAt(e - 1))) {
       let runStart = e - 1;
-      while (runStart > 0 && isBreakingSpace(input.charCodeAt(runStart - 1))) runStart--;
-      if (endsWithTerminator(input, runStart, isTerminator)) return e;
+      while (runStart > start && isBreakingSpace(input.charCodeAt(runStart - 1))) runStart--;
+      // A run that reaches `start` has nothing before it in the chunk.
+      if (endsWithTerminator(input, start, runStart, isTerminator)) return e;
       e = runStart;
       continue;
     }
@@ -650,7 +665,7 @@ function lastSentenceEnd(input: string, lowest: number, highest: number): number
     // Never between closers, so closing quotes and brackets stay with their sentence.
     if (!isCloser(next)) {
       const terminator = isBreakingSpace(next) ? isTerminator : isFullwidthTerminator;
-      if (endsWithTerminator(input, e, terminator)) return e;
+      if (endsWithTerminator(input, start, e, terminator)) return e;
     }
     e--;
   }
@@ -675,6 +690,22 @@ function snapToWordStart(input: string, pos: number, limit: number): number {
     if (isBreakingSpace(input.charCodeAt(p - 1))) return p;
   }
   return pos;
+}
+
+/**
+ * Counts with a caller-supplied tokenizer. An exception from it becomes a
+ * JevValidationError, so every error stays a JevInfiniteCTXError; the
+ * original is kept only as `cause`, and the message never includes the text.
+ */
+function countTokens(tokenizer: Tokenizer, text: string): number {
+  let value: unknown;
+  try {
+    value = tokenizer.count(text);
+  } catch (error) {
+    if (error instanceof JevInfiniteCTXError) throw error;
+    throw new JevValidationError(`Tokenizer "${tokenizer.name}" threw while counting tokens`, { cause: error });
+  }
+  return normalizeTokenCount(value, tokenizer.name);
 }
 
 function assertTokenizer(tokenizer: Tokenizer, label: string): void {
