@@ -21,7 +21,7 @@ Jev is TypeSafe's decision model. It answers typed questions (`choice`, `score`,
 ## Install
 
 ```bash
-npm install jev-long
+npm install github:taylorbayouth/jev-infinite-ctx   # not on npm yet
 ```
 
 jev-long calls Jev through OpenRouter's Decisions API. Set `OPENROUTER_API_KEY`, or pass `apiKey`.

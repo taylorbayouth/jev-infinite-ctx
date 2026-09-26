@@ -75,7 +75,7 @@ Identical answers give 1. Two chunks that give opposite, certain answers give 0.
 ## 6. Requests
 
 - Four at a time, each with a 60-second timeout.
-- Retried up to 3 times, with exponential backoff (about 0.5 s, 1 s, and 2 s, with jitter): HTTP 408, 429, and 5xx, network errors, and timeouts. `Retry-After` is honored, up to 30 seconds.
+- Retried up to 3 times, with exponential backoff and jitter (waits of up to 0.5 s, 1 s, then 2 s): HTTP 408, 429, and 5xx, network errors, and timeouts. `Retry-After` is honored, up to 30 seconds.
 - Any other failure, or a malformed answer, fails the call with `request_failed` and cancels the chunks still in flight. No answer is computed from part of the input.
 - Error messages include the provider's own message, unless it quotes the input (any 20-character run in common). That way input text never ends up in an error that gets logged.
 

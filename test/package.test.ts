@@ -64,4 +64,20 @@ describe("types", () => {
     });
     expect(errors.inference).toEqual([]);
   });
+
+  it("compiles the README examples", () => {
+    const readme = readFileSync(path.join(root, "README.md"), "utf8");
+    const blocks = [...readme.matchAll(/```ts\n([\s\S]*?)```/g)].map((match) => match[1]!);
+    expect(blocks.length).toBeGreaterThanOrEqual(3);
+    const errors = typeErrors({
+      readme: [
+        'import { decide } from "../src/index.js";',
+        'declare const document: string, contract: string, input: string, signal: AbortSignal;',
+        'declare const question: import("../src/index.js").Question;',
+        ...blocks.map((block, i) => `async function example${i}() {\n${block.replace(/^import .*$/m, "")}\n}`),
+        `export { ${blocks.map((_, i) => `example${i}`).join(", ")} };`,
+      ].join("\n"),
+    });
+    expect(errors.readme).toEqual([]);
+  });
 });
