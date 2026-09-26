@@ -1,3 +1,5 @@
+> **Superseded.** This is the original v0.1 specification, kept for reference. jev-long 0.2 deliberately simplified it: C3 confidence calibration and the extra aggregation methods were removed, agreement became pairwise, the input is bounded by `maxInputTokens` (250K by default), and most options became fixed defaults. See [how-it-works.md](how-it-works.md) for the current model and the reasons for each change.
+
 # JevInfiniteCTX — Long-Context Decision Wrapper
 
 **Status:** Draft specification 0.1  
