@@ -3,9 +3,12 @@
  * encoding, deadline and abort handling, provider error classification, and
  * strict parsing of the Decisions wire format into `NativeJevResponse`.
  *
- * Invariant: no error created here carries request state in its message or
- * `body` (spec 16: never log source text). Provider bodies are truncated and
- * scrubbed of any echo of the state before they are attached to an error.
+ * Invariant: no error message created here quotes provider text for a request
+ * that carried state, so messages never contain it (spec 16: never log source
+ * text). A provider can quote any fragment of the state, and a short one
+ * cannot be told apart from ordinary words, so `body` is scrubbed on a
+ * best-effort basis: every run of MIN_ECHO_RUN or more characters shared with
+ * the state is redacted, including runs hidden by JSON escaping.
  */
 
 import {
@@ -80,7 +83,7 @@ export async function postDecision(
         kind: "invalid_response",
         status: response.status,
         retryable: false,
-        body: sanitize(text, secret, MAX_ERROR_BODY_CHARS),
+        body: redactBody(text, secret),
         cause: error,
       },
     );
@@ -265,8 +268,11 @@ function describeNetworkError(error: unknown): string {
 /**
  * Maps a failed provider response to a `JevProviderError` (spec 7 error
  * behavior). `status` is undefined for a 2xx body whose `error` object has no
- * numeric code. `redact` is the request state: any echo of it is removed from
- * the error's message and `body`.
+ * numeric code. `redact` is the request state. When it is given, the message
+ * names only the provider, status, and kind, echoes of the state are redacted
+ * from `body`, and long echoes are ignored when choosing the kind, so the
+ * document's own wording cannot make a 4xx look like a context-limit error or
+ * an overload.
  */
 export function classifyHttpError(
   status: number | undefined,
@@ -275,8 +281,15 @@ export function classifyHttpError(
   providerName: string,
   redact?: string,
 ): JevProviderError {
-  const kind = kindForStatus(status, bodyText);
-  const detail = sanitize(providerMessage(bodyText), redact, MAX_ERROR_DETAIL_CHARS, true);
+  const text = scanWindow(bodyText);
+  // An empty body has nothing to scan, so the state is not indexed for it.
+  const index = text === "" ? undefined : echoIndex(redact);
+  const echoes = index === undefined ? undefined : scanEchoes(text, index, true);
+  const kind = kindForStatus(status, echoes === undefined ? text : replaceRanges(text, echoes.strip, ECHO_SEPARATOR));
+  // Provider text can quote any fragment of the state, including ones too
+  // short to find, and messages are what callers log (JevChunkFailedError
+  // quotes this one). It stays, redacted, on `body` instead.
+  const detail = index === undefined ? quotedDetail(providerMessage(text)) : undefined;
   const head =
     status === undefined
       ? `${providerName} returned an error (${kind})`
@@ -285,7 +298,7 @@ export function classifyHttpError(
     kind,
     status,
     retryAfterMs: parseRetryAfter(headers?.get("retry-after")),
-    body: sanitize(bodyText, redact, MAX_ERROR_BODY_CHARS),
+    body: redactedBody(text, index, echoes?.redact ?? []),
   });
 }
 
@@ -342,8 +355,9 @@ export function parseRetryAfter(value: string | null | undefined, nowMs: number 
 
 /**
  * Phrases providers use for "the request is larger than the model accepts".
- * Each pattern is tied to context, tokens, length, or size so that generic
- * token errors ("invalid token", "token expired") are not matched.
+ * Each pattern is tied to context, tokens, length, or size (or a large count
+ * of tokens or characters) so that generic token errors ("invalid token",
+ * "token expired") are not matched.
  */
 const CONTEXT_LIMIT_PATTERNS: readonly RegExp[] = [
   // "context length", "context_length_exceeded", "context window", "context limit", "context size"
@@ -357,6 +371,13 @@ const CONTEXT_LIMIT_PATTERNS: readonly RegExp[] = [
   // "input tokens exceed", "prompt length exceeds", "state size exceeded"
   /\b(?:input|prompt|state|request|total)[\s_-]*(?:tokens?|length|size)\b[^.;\n]{0,30}?\bexceed/i,
   /\breduce the (?:length|size) of\b/i,
+  // "state exceeds 32000 tokens", "input exceeded 128,000 characters". The size
+  // must be at least 1,000 (so field limits such as "64 characters" are not
+  // matched), and output-token limits and rate limits are excluded.
+  /(?<!\b(?:max_(?:completion_)?tokens|rate[\s_-]*limit)\b[^.;\n]{0,40})\bexceed(?:s|ed|ing)?\b[^.;\n]{0,40}?(?<![\d,])(?:\d{1,3}(?:,\d{3})+|\d{4,})\s*(?:tokens?|characters?|chars)\b(?!\s*(?:per|\/)\s*(?:min|minute|sec|second|hour|day)\b)/i,
+  // Max-length validators on the state: pydantic v2 "String should have at
+  // most 128000 characters", pydantic v1 "ensure this value has at most ...".
+  /(?<!\bmax_(?:completion_)?tokens\b[^.;\n]{0,40})\bat most\s+(?:\d{1,3}(?:,\d{3})+|\d{4,})\s*(?:tokens?|characters?|chars)\b/i,
 ];
 
 /** True when a provider message says the request exceeded the model's context. */
@@ -392,11 +413,29 @@ function providerMessage(bodyText: string): string {
 
 const REDACTION_MARKER = "[redacted]";
 /**
- * Width of the aligned probes used to find echoed state. Any run of at least
- * 2 * ECHO_PROBE_CHARS - 1 characters shared with the state contains a
- * probe-aligned window, so every such run is found and removed.
+ * Shortest run of characters shared with the state that `body` treats as an
+ * echo. Every such run is found, at any offset. Shorter fragments cannot be
+ * told apart from ordinary words, which is why messages never quote provider
+ * text for a request that carried state.
  */
-const ECHO_PROBE_CHARS = 16;
+const MIN_ECHO_RUN = 8;
+/**
+ * Shortest shared run ignored when classifying. Longer than MIN_ECHO_RUN
+ * because a provider's own wording ("maximum context length") can also occur
+ * in the document, and ignoring that coincidence would hide a genuine
+ * context-limit error. A real echo is the state or a long slice of it.
+ */
+const MIN_CLASSIFY_ECHO_RUN = 32;
+/**
+ * Levels of JSON escaping undone when looking for echoes: one for a state
+ * quoted in a JSON string, two for a JSON body nested in a JSON string (as in
+ * OpenRouter's `metadata.raw`), and one spare.
+ */
+const MAX_UNESCAPE_LEVELS = 3;
+/** Longest prefix of a provider body that is scanned for echoes and classified. */
+const MAX_SCAN_CHARS = 1_000_000;
+/** Stands in for an ignored echo; no context-limit or overload pattern matches across it. */
+const ECHO_SEPARATOR = "\n.\n";
 
 /** The text that must never appear in an error built for this body. */
 function stateSecret(body: JsonObject): string | undefined {
@@ -405,21 +444,13 @@ function stateSecret(body: JsonObject): string | undefined {
   return typeof state === "string" ? state : JSON.stringify(state);
 }
 
-/**
- * Truncates, redacts, optionally collapses whitespace, and truncates again;
- * returns undefined for an empty result. Redaction runs before collapsing
- * (collapsing would hide a multi-line echo from exact matching) and again
- * after it (collapsing can join fragments into a longer echo).
- */
-function sanitize(
-  text: string,
-  secret: string | undefined,
-  maxChars: number,
-  collapseWhitespace = false,
-): string | undefined {
-  let cleaned = redactSecret(truncate(text, maxChars), secret);
-  if (collapseWhitespace) cleaned = redactSecret(cleaned.replace(/\s+/g, " ").trim(), secret);
-  cleaned = truncate(cleaned, maxChars);
+function scanWindow(text: string): string {
+  return text.length > MAX_SCAN_CHARS ? text.slice(0, MAX_SCAN_CHARS) : text;
+}
+
+/** Collapses whitespace and truncates a provider message; undefined when empty. */
+function quotedDetail(text: string): string | undefined {
+  const cleaned = truncate(text.replace(/\s+/g, " ").trim(), MAX_ERROR_DETAIL_CHARS);
   return cleaned === "" ? undefined : cleaned;
 }
 
@@ -432,76 +463,253 @@ function truncate(text: string, maxChars: number): string {
   return `${text.slice(0, end)}…`;
 }
 
+/** A provider body kept on an error: echoes of `secret` redacted, then truncated. */
+function redactBody(bodyText: string, secret: string | undefined): string | undefined {
+  const text = scanWindow(bodyText);
+  const index = text === "" ? undefined : echoIndex(secret);
+  return redactedBody(text, index, index === undefined ? [] : scanEchoes(text, index, false).redact);
+}
+
 /**
- * Removes every echo of `secret` from `text`: whole occurrences (raw or
- * JSON-escaped, as a provider may quote the state inside a JSON message) and
- * any long partial run. If a marker would itself recreate the secret (a
- * secret as short as "e"), the text is withheld entirely.
+ * Replaces `echoes` with a marker and truncates; undefined for an empty
+ * result. Redaction runs before truncation so that a cut cannot leave an
+ * echo too short to find. If the marker would itself spell out the state (a
+ * state as short as "e"), the body is withheld entirely.
  */
-function redactSecret(text: string, secret: string | undefined): string {
-  if (secret === undefined || secret === "" || text === "") return text;
-  const variants = secretVariants(secret);
-  let out = text;
-  for (const variant of variants) out = redactVariant(out, variant);
-  return variants.some((variant) => out.includes(variant)) ? "" : out;
-}
-
-function secretVariants(secret: string): string[] {
-  const json = JSON.stringify(secret).slice(1, -1);
-  // ASCII-only JSON, as emitted by e.g. Python's json.dumps default.
-  const asciiJson = json.replace(
-    /[\u0080-\uffff]/g,
-    (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`,
-  );
-  return [...new Set([secret, json, asciiJson])];
-}
-
-function redactVariant(text: string, secret: string): string {
-  const exact = text.split(secret).join(REDACTION_MARKER);
-  if (secret.length < ECHO_PROBE_CHARS) return exact;
-
-  const ranges: Array<[number, number]> = [];
-  let pos = 0;
-  while (pos + ECHO_PROBE_CHARS <= exact.length) {
-    const at = secret.indexOf(exact.slice(pos, pos + ECHO_PROBE_CHARS));
-    if (at < 0) {
-      pos += ECHO_PROBE_CHARS;
-      continue;
-    }
-    let start = pos;
-    let s = at;
-    while (start > 0 && s > 0 && exact.charCodeAt(start - 1) === secret.charCodeAt(s - 1)) {
-      start -= 1;
-      s -= 1;
-    }
-    let end = pos + ECHO_PROBE_CHARS;
-    let e = at + ECHO_PROBE_CHARS;
-    while (end < exact.length && e < secret.length && exact.charCodeAt(end) === secret.charCodeAt(e)) {
-      end += 1;
-      e += 1;
-    }
-    ranges.push([start, end]);
-    pos = end;
+function redactedBody(text: string, index: EchoIndex | undefined, echoes: readonly Range[]): string | undefined {
+  const redacted = replaceRanges(text, echoes, REDACTION_MARKER);
+  if (index !== undefined && index.grams === undefined && scanEchoes(redacted, index, false).redact.length > 0) {
+    return undefined;
   }
-  if (ranges.length === 0) return exact;
+  const kept = truncate(redacted, MAX_ERROR_BODY_CHARS);
+  return kept === "" ? undefined : kept;
+}
 
-  // A later probe can extend left past an earlier range (a different
-  // occurrence in the secret), so sort, then merge overlapping or adjacent
-  // ranges so each echo becomes a single marker.
+/** The request state, prepared for finding echoes of it. */
+interface EchoIndex {
+  /** The state with each whitespace run collapsed to one space. */
+  readonly text: string;
+  /** Every MIN_ECHO_RUN-character substring of `text`; undefined when `text` is shorter. */
+  readonly grams: ReadonlySet<string> | undefined;
+  /** Every MIN_CLASSIFY_ECHO_RUN-character substring, built on first use. */
+  classifyGrams: ReadonlySet<string> | undefined;
+}
+
+function echoIndex(secret: string | undefined): EchoIndex | undefined {
+  if (secret === undefined || secret === "") return undefined;
+  const text = makeView(secret, undefined, false).text;
+  return {
+    text,
+    grams: text.length < MIN_ECHO_RUN ? undefined : substrings(text, MIN_ECHO_RUN),
+    classifyGrams: undefined,
+  };
+}
+
+function substrings(text: string, length: number): Set<string> {
+  const set = new Set<string>();
+  for (let i = 0; i + length <= text.length; i += 1) set.add(text.slice(i, i + length));
+  return set;
+}
+
+/** Offsets [start, end) into the scanned provider text. */
+type Range = [start: number, end: number];
+
+interface EchoScan {
+  /** Echoes to redact from `body`: every run of MIN_ECHO_RUN or more shared characters. */
+  redact: Range[];
+  /** Echoes to ignore when classifying: runs of MIN_CLASSIFY_ECHO_RUN or more, or the whole state. */
+  strip: Range[];
+}
+
+/**
+ * Finds echoes of the state in `text` and in successively unescaped views of
+ * it, so an echo is found whether it is raw, JSON-escaped once or twice,
+ * \u-escaped in either case (Python, Go's <, .NET), or re-wrapped.
+ * A state shorter than MIN_ECHO_RUN is only matched whole.
+ */
+function scanEchoes(text: string, index: EchoIndex, classify: boolean): EchoScan {
+  const redact: Range[] = [];
+  const strip: Range[] = [];
+  forEachView(text, (view) => {
+    if (index.grams === undefined) {
+      occurrences(view, index.text, redact);
+      return;
+    }
+    const longest = sharedRuns(view, index.grams, MIN_ECHO_RUN, redact);
+    if (!classify || longest < Math.min(index.text.length, MIN_CLASSIFY_ECHO_RUN)) return;
+    if (index.text.length < MIN_CLASSIFY_ECHO_RUN) {
+      occurrences(view, index.text, strip);
+    } else {
+      index.classifyGrams ??= substrings(index.text, MIN_CLASSIFY_ECHO_RUN);
+      sharedRuns(view, index.classifyGrams, MIN_CLASSIFY_ECHO_RUN, strip);
+    }
+  });
+  return { redact: mergeRanges(redact), strip: mergeRanges(strip) };
+}
+
+/**
+ * A normalized copy of provider text: each whitespace run collapsed to one
+ * space (a provider may re-wrap an echo) and, when `unescape` is set, one
+ * level of JSON escaping undone. Character j came from original offsets
+ * [start[j], end[j]), so a match in the view maps back to what it replaces.
+ */
+interface View {
+  readonly text: string;
+  readonly start: Int32Array;
+  readonly end: Int32Array;
+}
+
+/** Calls `visit` with the text's view at each escaping level, stopping once nothing is left to unescape. */
+function forEachView(text: string, visit: (view: View) => void): void {
+  let view = makeView(text, undefined, false);
+  visit(view);
+  for (let level = 1; level <= MAX_UNESCAPE_LEVELS && view.text.includes("\\"); level += 1) {
+    const next = makeView(view.text, view, true);
+    // Every undone escape shortens the text, so an equal length means none was.
+    if (next.text.length === view.text.length) return;
+    view = next;
+    visit(view);
+  }
+}
+
+/** Builds a view of `source`, which is `parent`'s text (offsets then map through `parent`) or the original. */
+function makeView(source: string, parent: View | undefined, unescape: boolean): View {
+  const codes = new Uint16Array(source.length);
+  const start = new Int32Array(source.length);
+  const end = new Int32Array(source.length);
+  let length = 0;
+  let i = 0;
+  while (i < source.length) {
+    let code = source.charCodeAt(i);
+    let next = i + 1;
+    if (unescape && code === 0x5c) {
+      const escaped = unescapeAt(source, i);
+      if (escaped !== undefined) [code, next] = escaped;
+    }
+    const from = parent === undefined ? i : parent.start[i]!;
+    const to = parent === undefined ? next : parent.end[next - 1]!;
+    const space = isWhitespace(code);
+    if (space && length > 0 && codes[length - 1] === 0x20) {
+      end[length - 1] = to;
+    } else {
+      codes[length] = space ? 0x20 : code;
+      start[length] = from;
+      end[length] = to;
+      length += 1;
+    }
+    i = next;
+  }
+  let text = "";
+  for (let at = 0; at < length; at += 8192) {
+    text += String.fromCharCode(...codes.subarray(at, Math.min(length, at + 8192)));
+  }
+  return { text, start: start.subarray(0, length), end: end.subarray(0, length) };
+}
+
+/** The character a JSON escape at `i` stands for (hex in either case) and the offset after it. */
+function unescapeAt(text: string, i: number): [code: number, next: number] | undefined {
+  const code = text.charCodeAt(i + 1);
+  switch (code) {
+    case 0x22: // "
+    case 0x2f: // /
+    case 0x5c: // \
+      return [code, i + 2];
+    case 0x62: // b
+      return [0x08, i + 2];
+    case 0x66: // f
+      return [0x0c, i + 2];
+    case 0x6e: // n
+      return [0x0a, i + 2];
+    case 0x72: // r
+      return [0x0d, i + 2];
+    case 0x74: // t
+      return [0x09, i + 2];
+    case 0x75: {
+      // u
+      const hex = text.slice(i + 2, i + 6);
+      return /^[0-9a-f]{4}$/i.test(hex) ? [Number.parseInt(hex, 16), i + 6] : undefined;
+    }
+    default:
+      return undefined;
+  }
+}
+
+/** Same set as the regular expression class \s. */
+function isWhitespace(code: number): boolean {
+  return (
+    (code >= 0x09 && code <= 0x0d) ||
+    code === 0x20 ||
+    code === 0xa0 ||
+    code === 0x1680 ||
+    (code >= 0x2000 && code <= 0x200a) ||
+    code === 0x2028 ||
+    code === 0x2029 ||
+    code === 0x202f ||
+    code === 0x205f ||
+    code === 0x3000 ||
+    code === 0xfeff
+  );
+}
+
+/**
+ * Appends the original ranges of `view` covered by `size`-character
+ * substrings that also occur in the state, merging overlapping or touching
+ * ones, so every shared run of at least `size` characters is covered end to
+ * end. Returns the longest merged run, in view characters.
+ */
+function sharedRuns(view: View, grams: ReadonlySet<string>, size: number, out: Range[]): number {
+  const text = view.text;
+  let longest = 0;
+  let runStart = -1;
+  let runEnd = -1;
+  const flush = (): void => {
+    if (runStart < 0) return;
+    out.push([view.start[runStart]!, view.end[runEnd - 1]!]);
+    longest = Math.max(longest, runEnd - runStart);
+  };
+  for (let i = 0; i + size <= text.length; i += 1) {
+    if (!grams.has(text.slice(i, i + size))) continue;
+    if (runStart >= 0 && i <= runEnd) {
+      runEnd = i + size;
+    } else {
+      flush();
+      runStart = i;
+      runEnd = i + size;
+    }
+  }
+  flush();
+  return longest;
+}
+
+/** Appends the original range of every occurrence of `needle` in `view`. */
+function occurrences(view: View, needle: string, out: Range[]): void {
+  for (let at = view.text.indexOf(needle); at >= 0; at = view.text.indexOf(needle, at + 1)) {
+    out.push([view.start[at]!, view.end[at + needle.length - 1]!]);
+  }
+}
+
+/** Sorts ranges and merges overlapping or touching ones, so adjacent echoes become one. */
+function mergeRanges(ranges: Range[]): Range[] {
   ranges.sort((a, b) => a[0] - b[0]);
-  const merged: Array<[number, number]> = [];
+  const merged: Range[] = [];
   for (const [start, end] of ranges) {
     const last = merged[merged.length - 1];
     if (last !== undefined && start <= last[1]) last[1] = Math.max(last[1], end);
     else merged.push([start, end]);
   }
+  return merged;
+}
+
+/** Replaces each of the sorted, disjoint `ranges` of `text` with `replacement`. */
+function replaceRanges(text: string, ranges: readonly Range[], replacement: string): string {
+  if (ranges.length === 0) return text;
   let out = "";
   let cursor = 0;
-  for (const [start, end] of merged) {
-    out += exact.slice(cursor, start) + REDACTION_MARKER;
+  for (const [start, end] of ranges) {
+    out += text.slice(cursor, start) + replacement;
     cursor = end;
   }
-  return out + exact.slice(cursor);
+  return out + text.slice(cursor);
 }
 
 // ---------------------------------------------------------------------------
@@ -751,26 +959,40 @@ export function mergeHeaders(
     throw new JevValidationError(`${providerLabel}: headers must be an object of strings`);
   }
   const headers = new Headers();
-  try {
-    for (const [name, value] of Object.entries(extra ?? {})) {
-      if (typeof value !== "string") {
-        throw new JevValidationError(`${providerLabel}: headers[${quote(name)}] must be a string`);
-      }
-      headers.set(name, value);
+  for (const [name, value] of Object.entries(extra ?? {})) {
+    if (typeof value !== "string") {
+      throw new JevValidationError(`${providerLabel}: headers[${quote(name)}] must be a string`);
     }
-    for (const [name, value] of Object.entries(fixed)) {
-      if (value !== undefined) headers.set(name, value);
+    if (!trySetHeader(headers, name, value)) {
+      throw new JevValidationError(`${providerLabel}: headers[${quote(name)}] is not a valid HTTP header name and value`);
     }
-  } catch (error) {
-    if (error instanceof JevValidationError) throw error;
-    // The platform message may quote the offending value (possibly the API
-    // key), so it is kept only on `cause`.
-    throw new JevValidationError(`${providerLabel}: a header name or value is not valid HTTP`, { cause: error });
+  }
+  for (const [name, value] of Object.entries(fixed)) {
+    if (value !== undefined && !trySetHeader(headers, name, value)) {
+      const what = name.toLowerCase() === "authorization" ? "the API key" : `the ${name} header value`;
+      throw new JevValidationError(
+        `${providerLabel}: ${what} contains a character HTTP headers do not allow (such as CR, LF, or NUL)`,
+      );
+    }
   }
   // forEach rather than entries(): the tsconfig lib has DOM but not DOM.Iterable.
   const merged: Array<[string, string]> = [];
   headers.forEach((value, name) => merged.push([name, value]));
   return Object.fromEntries(merged);
+}
+
+/**
+ * Sets one header; false when the platform rejects the name or value. The
+ * platform error is dropped rather than kept as `cause`: its message quotes
+ * the value, which may be the API key, and loggers print the cause chain.
+ */
+function trySetHeader(headers: Headers, name: string, value: string): boolean {
+  try {
+    headers.set(name, value);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------

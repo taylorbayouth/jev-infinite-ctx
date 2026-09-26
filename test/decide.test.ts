@@ -1,8 +1,11 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { aggregate } from "../src/aggregation.js";
 import { computeStateBudget } from "../src/chunking.js";
 import { decide, resolveTransport } from "../src/decide.js";
-import { DEFAULTS, MIN_STATE_TOKENS, QUESTION_KEY } from "../src/defaults.js";
+import { ARGMAX_TIE_TOLERANCE, DEFAULTS, MIN_STATE_TOKENS, QUESTION_KEY } from "../src/defaults.js";
 import {
   JevAbortError,
   JevChunkFailedError,
@@ -11,11 +14,12 @@ import {
   JevResponseError,
   JevValidationError,
 } from "../src/errors.js";
-import { defaultTokenizer } from "../src/tokenizer.js";
+import { createTokenizer, defaultTokenizer } from "../src/tokenizer.js";
 import { DirectJevTransport } from "../src/transports/direct.js";
 import { OpenRouterJevTransport } from "../src/transports/openrouter.js";
 import { resolveOptions } from "../src/validation.js";
 import type {
+  AggregationMethod,
   ChoiceQuestion,
   ChunkResult,
   JevInfiniteCTXEvent,
@@ -37,6 +41,8 @@ import {
   providerError,
   scoreAnswer,
 } from "./helpers/mock-transport.js";
+import { buildInto, freshCheckout, isPublished, packedFiles, repoRoot } from "./helpers/packaging.js";
+import { typeErrors } from "./helpers/typecheck.js";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -148,8 +154,11 @@ function c3ByHand(base: number, agreement: number, nEff: number): number {
   return base + Math.max(0, cap - base) * saturation * gate;
 }
 
+/** spec 11.3: new content in units of the largest chunk, clamped to [1, N]. */
 function nEffByHand(results: readonly ChunkResult[]): number {
-  return results.slice(1).reduce((n, r) => n + r.uniqueTokens / Math.max(1, r.estimatedTokens), 1);
+  const unique = results.reduce((sum, r) => sum + r.uniqueTokens, 0);
+  const largest = Math.max(1, ...results.map((r) => r.estimatedTokens));
+  return Math.min(results.length, Math.max(1, unique / largest));
 }
 
 afterEach(() => {
@@ -210,6 +219,215 @@ describe("package entry point", () => {
       expect(entry[name], name).toBeUndefined();
     }
   });
+
+  it("exports DEFAULTS deeply frozen, so a consumer cannot change the defaults of later calls", () => {
+    // Checked first: mutating an unfrozen DEFAULTS below would leak into every later test.
+    for (const section of [DEFAULTS, DEFAULTS.chunking, DEFAULTS.execution, DEFAULTS.confidence]) {
+      expect(Object.isFrozen(section)).toBe(true);
+    }
+    // ESM is strict mode, so writing to a frozen object throws.
+    expect(() => Object.assign(DEFAULTS.confidence, { method: "none" })).toThrow(TypeError);
+    expect(() => Object.assign(DEFAULTS.execution, { retries: 0, maxConcurrency: 1 })).toThrow(TypeError);
+    const resolved = resolveOptions({ input: "Text.", question: NOUL });
+    expect(resolved.confidence.method).toBe("c3");
+    expect(resolved.execution.retries).toBe(3);
+    expect(resolved.execution.maxConcurrency).toBe(4);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Public types (vitest does not typecheck, so these run the compiler)
+// ---------------------------------------------------------------------------
+
+describe("public types", () => {
+  const PRELUDE = `
+import { decide } from "../src/index.js";
+import type { JevCriterion, NoulQuestion, ScoreQuestion } from "../src/index.js";
+declare const input: string;
+`;
+  const SNIPPETS = {
+    mutableScore: `${PRELUDE}
+void decide({ input, question: { type: "score", instructions: "Rate", criteria: ["Low", "High"] } });
+`,
+    asConstScore: `${PRELUDE}
+const RISK = { type: "score", instructions: "Rate", criteria: ["Low", "High"] } as const;
+void decide({ input, question: RISK });
+`,
+    readonlyRubric: `${PRELUDE}
+const RUBRIC = ["Low", "Medium", "High"] as const;
+const LEVELS: readonly string[] = ["Low", "High"];
+export const a: ScoreQuestion = { type: "score", instructions: "Rate", criteria: RUBRIC };
+export const b: ScoreQuestion = { type: "score", instructions: "Rate", criteria: LEVELS };
+`,
+    asConstStructured: `${PRELUDE}
+const CHOICE = {
+  type: "choice",
+  instructions: "Pick",
+  criteria: { a: { what: "A", examples: ["x", "y"] }, b: "B." },
+} as const;
+void decide({ input, question: CHOICE }).then((result) => {
+  const choice: "a" | "b" = result.choice;
+  return choice;
+});
+const INSTR = { task: "Classify", notes: ["one", "two"] } as const;
+export const n: NoulQuestion = { type: "noul", instructions: INSTR };
+`,
+    notJson: `${PRELUDE}
+export const bad: JevCriterion = [() => 1];
+`,
+  };
+  let errors: Record<string, string[]> = {};
+  // One program for every snippet, compiled only when this block runs.
+  beforeAll(() => {
+    errors = typeErrors(SNIPPETS);
+  }, 60_000);
+
+  it.each(["mutableScore", "asConstScore", "readonlyRubric", "asConstStructured"])(
+    "accepts the %s question shape",
+    (name) => {
+      expect(errors[name]).toEqual([]);
+    },
+  );
+
+  it("still rejects criteria that are not JSON values (so the checks above are not vacuous)", () => {
+    expect(errors["notJson"]?.length).toBeGreaterThan(0);
+  });
+});
+
+describe("public types under exactOptionalPropertyTypes", () => {
+  // A consumer with the flag on must be able to pass possibly-unset values
+  // (README: `apiKey: process.env.OPENROUTER_API_KEY`); runtime reads an
+  // explicit undefined as omitted.
+  const SNIPPETS = {
+    readmeExample: `
+import { decide, DirectJevTransport, OpenRouterJevTransport } from "../src/index.js";
+
+const transport = new OpenRouterJevTransport({
+  apiKey: process.env.OPENROUTER_API_KEY,
+  appName: "contract-review",
+  appUrl: "https://example.com",
+  sessionId: "batch-2026-09-25",
+  timeoutMs: 30_000,
+});
+export const direct = new DirectJevTransport({ apiKey: process.env.TYPESAFE_API_KEY });
+void decide({
+  input: "x",
+  question: { type: "noul", instructions: "q" },
+  provider: { transport, apiKey: process.env.OPENROUTER_API_KEY },
+});
+`,
+    everyInputOption: `
+import { decide, JevProviderError, serializeResult } from "../src/index.js";
+import type { JevInfiniteCTXEvent, NativeJevRequest, NativeJevUsage, Tokenizer } from "../src/index.js";
+
+declare function maybe<T>(): T | undefined;
+
+void decide({
+  input: "x",
+  question: { type: "noul", instructions: "q", criteria: maybe<{ true: string; false: string }>() },
+  aggregation: maybe<"mean">(),
+  chunking: {
+    overlap: maybe<number>(),
+    maxStateTokens: maybe<number>(),
+    contextSafetyReserve: maybe<number>(),
+    protocolReserve: maybe<number>(),
+    preferNaturalBoundaries: maybe<boolean>(),
+    maxChunks: maybe<number>(),
+  },
+  confidence: {
+    method: maybe<"none">(),
+    cap: maybe<number>(),
+    lambda: maybe<number>(),
+    agreementFloor: maybe<number>(),
+    agreementExponent: maybe<number>(),
+  },
+  execution: {
+    maxConcurrency: maybe<number>(),
+    retries: maybe<number>(),
+    retryBaseDelayMs: maybe<number>(),
+    retryMaxDelayMs: maybe<number>(),
+    maxRechunks: maybe<number>(),
+    rechunkShrinkFactor: maybe<number>(),
+  },
+  provider: { transport: maybe<"direct">(), model: maybe<string>(), apiKey: maybe<string>() },
+  tokenizer: maybe<Tokenizer>(),
+  signal: maybe<AbortSignal>(),
+  onEvent: maybe<(event: JevInfiniteCTXEvent) => void>(),
+}).then((result) => serializeResult(result, { includeChunkResults: maybe<boolean>(), includeRawAnswers: maybe<boolean>() }));
+
+export const request: NativeJevRequest = { model: "m", state: "s", questions: {}, signal: maybe<AbortSignal>() };
+export const usage: NativeJevUsage = {
+  inputTokens: maybe<number>(),
+  outputTokens: maybe<number>(),
+  costUsd: maybe<number>(),
+};
+export const error = new JevProviderError("failed", {
+  kind: "server",
+  status: maybe<number>(),
+  retryAfterMs: maybe<number>(),
+  retryable: maybe<boolean>(),
+  body: maybe<string>(),
+});
+`,
+  };
+  let errors: Record<string, string[]> = {};
+  beforeAll(() => {
+    errors = typeErrors(SNIPPETS, { exactOptionalPropertyTypes: true });
+  }, 60_000);
+
+  it.each(Object.keys(SNIPPETS))("accepts an explicit undefined in the %s snippet", (name) => {
+    expect(errors[name]).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Package build and tarball
+// ---------------------------------------------------------------------------
+
+describe("package build and tarball", () => {
+  it("packs a fresh checkout (no dist/) with the built library, by building first", () => {
+    const dir = freshCheckout();
+    try {
+      const files = packedFiles(dir);
+      expect(files).toContain("dist/index.js");
+      expect(files).toContain("dist/index.d.ts");
+      expect(files).toContain("LICENSE");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it("ships the MIT license text that package.json declares", () => {
+    const pkg = JSON.parse(readFileSync(path.join(repoRoot, "package.json"), "utf8")) as { license?: string };
+    expect(pkg.license).toBe("MIT");
+    const text = readFileSync(path.join(repoRoot, "LICENSE"), "utf8");
+    expect(text).toMatch(/^MIT License\n/);
+    expect(text).toMatch(/Permission is hereby granted, free of charge/);
+  });
+
+  it("ships the source every emitted .map points at, or embeds it", () => {
+    const outDir = mkdtempSync(path.join(tmpdir(), "jev-build-"));
+    try {
+      const broken: string[] = [];
+      for (const mapFile of buildInto(outDir).filter((file) => file.endsWith(".map"))) {
+        const map = JSON.parse(readFileSync(mapFile, "utf8")) as {
+          sources: string[];
+          sourceRoot?: string;
+          sourcesContent?: Array<string | null>;
+        };
+        map.sources.forEach((source, i) => {
+          if (typeof map.sourcesContent?.[i] === "string") return;
+          // Relative to the map, a source resolves to the real file it came from (e.g. src/index.ts).
+          const absolute = path.resolve(path.dirname(mapFile), map.sourceRoot ?? "", source);
+          const target = path.relative(repoRoot, absolute);
+          if (!isPublished(target)) broken.push(`dist/${path.relative(outDir, mapFile)} -> ${target} (not published)`);
+        });
+      }
+      expect(broken).toEqual([]);
+    } finally {
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  }, 120_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -372,6 +590,90 @@ describe("decide: choice across many chunks", () => {
     expect(result.confidence.adjustment).toBe(0);
     expect(result.confidence.components.saturation).toBeGreaterThan(0);
     expect(result.confidence.components.gate).toBeCloseTo(1, 12);
+  });
+});
+
+describe("decide: choice ties", () => {
+  const TIE: ChoiceQuestion<"a" | "b" | "c"> = {
+    type: "choice",
+    instructions: "Which one?",
+    criteria: { a: "A.", b: "B.", c: "C." },
+  };
+  type Answer = Readonly<Record<"a" | "b" | "c", number>>;
+  // a and b tie at exactly 0.4 in decimal. In floating point the column sums
+  // depend on chunk order, and b comes out 1 ulp ahead in one of the orders.
+  const MEAN_TIE: readonly Answer[] = [
+    { a: 0.1, b: 0.7, c: 0.2 },
+    { a: 0.4, b: 0.4, c: 0.2 },
+    { a: 0.7, b: 0.1, c: 0.2 },
+  ];
+  const WEIGHTED_TIE: readonly Answer[] = [
+    { a: 0.2, b: 0.6, c: 0.2 },
+    { a: 0.4, b: 0.4, c: 0.2 },
+    { a: 0.6, b: 0.2, c: 0.2 },
+  ];
+
+  /** Three equal-weight chunks (one token per character, no overlap, hard cuts); chunk i gets perChunk[i]. */
+  async function decideTie(perChunk: readonly Answer[], aggregation: AggregationMethod) {
+    const mock = new MockTransport({ answer: (_s, _q, callIndex) => choiceAnswer({ ...perChunk[callIndex] }) });
+    const result = await decide(
+      request(TIE, "x".repeat(3 * MIN_STATE_TOKENS), mock, {
+        aggregation,
+        tokenizer: createTokenizer((text) => text.length, "chars"),
+        chunking: { maxStateTokens: MIN_STATE_TOKENS, overlap: 0, preferNaturalBoundaries: false },
+        // Sequential, so the call index is the chunk index.
+        execution: { maxConcurrency: 1, retryBaseDelayMs: 0 },
+      }),
+    );
+    expect(result.chunks.results.map((chunk) => chunk.weight)).toEqual([1 / 3, 1 / 3, 1 / 3]);
+    return result;
+  }
+
+  it.each([
+    ["mean", MEAN_TIE],
+    ["weighted_mean", WEIGHTED_TIE],
+  ] as const)("gives a %s tie to the earliest label in either chunk order", async (aggregation, perChunk) => {
+    const results = [await decideTie(perChunk, aggregation), await decideTie([...perChunk].reverse(), aggregation)];
+    for (const result of results) {
+      expect(Math.abs(result.probabilities.a - result.probabilities.b)).toBeLessThan(ARGMAX_TIE_TOLERANCE);
+      expect(result.probabilities.c).toBeCloseTo(0.2, 12);
+    }
+    // Float noise favors b in one order, so a strict comparison would return b there.
+    expect(results.some((result) => result.probabilities.b > result.probabilities.a)).toBe(true);
+    expect(results.map((result) => result.choice)).toEqual(["a", "a"]);
+  });
+
+  it("still picks a later label that leads by more than the tie tolerance", async () => {
+    const lead = 1e-9;
+    const result = await decideTie(Array.from({ length: 3 }, () => ({ a: 0.4, b: 0.4 + lead, c: 0.2 - lead })), "mean");
+    expect(result.probabilities.b - result.probabilities.a).toBeGreaterThan(ARGMAX_TIE_TOLERANCE);
+    expect(result.choice).toBe("b");
+  });
+});
+
+describe("decide: C3 and a short final chunk", () => {
+  it("does not become more confident when a tiny contradicting tail is appended", async () => {
+    // Chunks containing "y" disagree completely with the rest.
+    const answer = (state: string): NativeChoiceAnswer =>
+      state.includes("y")
+        ? choiceAnswer({ tree: 0, rock: 1, other: 0 }, 0.6)
+        : choiceAnswer({ tree: 0.9, rock: 0.1, other: 0 }, 0.6);
+    const run = (input: string) =>
+      decide(
+        request(CHOICE, input, new MockTransport({ answer }), {
+          tokenizer: createTokenizer((text) => text.length, "chars"),
+          chunking: { maxStateTokens: 1000, overlap: 0, preferNaturalBoundaries: false },
+        }),
+      );
+
+    const alone = await run("x".repeat(1000));
+    const withTail = await run("x".repeat(1000) + "y".repeat(10));
+
+    expect(alone.chunks.count).toBe(1);
+    expect(withTail.chunks.count).toBe(2);
+    // The 10-token tail adds 1% of a chunk to N_eff, not a whole chunk.
+    expect(withTail.chunks.effectiveCount).toBeCloseTo(1.01, 12);
+    expect(withTail.confidence.adjusted - alone.confidence.adjusted).toBeLessThan(0.01);
   });
 });
 
@@ -1128,6 +1430,34 @@ describe("decide: validation and budgeting", () => {
     expect(result.usage.inputTokensEstimated).toBe(1_000);
     expect(mock.states.every((s) => s.length <= MIN_STATE_TOKENS)).toBe(true);
     expect(result.chunks.count).toBeGreaterThan(3);
+  });
+
+  it("validates and resolves the options once, reading each option section and value exactly once", async () => {
+    const mock = new MockTransport({ script: [noulAnswer(0.25)] });
+    let sectionReads = 0;
+    let overlapReads = 0;
+    const chunking = {};
+    Object.defineProperty(chunking, "overlap", {
+      enumerable: true,
+      get() {
+        overlapReads++;
+        return 0.1;
+      },
+    });
+    const req = { input: "some text about trees", question: NOUL, provider: { transport: mock } };
+    Object.defineProperty(req, "chunking", {
+      enumerable: true,
+      get() {
+        sectionReads++;
+        return chunking;
+      },
+    });
+
+    const result = await decide(req);
+
+    expect(result.chunks.overlap).toBe(0.1);
+    expect(sectionReads).toBe(1);
+    expect(overlapReads).toBe(1);
   });
 });
 

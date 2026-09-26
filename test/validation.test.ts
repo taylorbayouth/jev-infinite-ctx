@@ -2,7 +2,12 @@ import { describe, expect, it } from "vitest";
 import { DEFAULTS, MAX_SCORE_LEVELS, MIN_STATE_TOKENS } from "../src/defaults.js";
 import { JevValidationError } from "../src/errors.js";
 import type { JevInfiniteCTXRequest, JevTransport } from "../src/types.js";
-import { resolveOptions, validateQuestion, validateRequest } from "../src/validation.js";
+import {
+  resolveOptions,
+  validateQuestion,
+  validateRequest,
+  validateRequestAndResolve,
+} from "../src/validation.js";
 
 // Tests deliberately feed malformed shapes, so they work with loosely typed objects.
 type Loose = Record<string, unknown>;
@@ -248,6 +253,20 @@ describe("validateQuestion: choice criteria", () => {
     );
   });
 
+  // README "Question rules": every criterion must be a non-empty string (or JSON object/array).
+  it.each(["", "  \n"])("rejects a blank option description %j, naming the option", (value) => {
+    expectInvalid(
+      () => validateQuestion(choice({ a: "A", b: value })),
+      "question.criteria.b",
+      "non-empty string",
+    );
+    expectInvalid(() => validateQuestion(choice({ a: value, b: "B" })), "question.criteria.a");
+  });
+
+  it("still accepts empty object and array option descriptions", () => {
+    expect(() => validateQuestion(choice({ a: {}, b: [] }))).not.toThrow();
+  });
+
   it("names odd option keys with bracket notation", () => {
     expectInvalid(() => validateQuestion(choice({ ok: "x", "my key": null })), 'question.criteria["my key"]');
   });
@@ -295,6 +314,10 @@ describe("validateQuestion: score criteria", () => {
     expectInvalid(() => validateQuestion(score(["low", value, "high"])), "question.criteria[1]");
   });
 
+  it.each(["", " ", "\t\n"])("rejects a blank level %j, naming its index", (value) => {
+    expectInvalid(() => validateQuestion(score(["low", value])), "question.criteria[1]", "non-empty string");
+  });
+
   it("rejects holes in a sparse rubric", () => {
     const sparse: unknown[] = ["low"];
     sparse[2] = "high";
@@ -325,6 +348,11 @@ describe("validateQuestion: noul criteria", () => {
   it("names the invalid side", () => {
     expectInvalid(() => validateQuestion(noul({ true: null, false: "no" })), "question.criteria.true");
     expectInvalid(() => validateQuestion(noul({ true: "yes", false: 0 })), "question.criteria.false");
+  });
+
+  it.each(["", "   "])("rejects a blank description %j, naming the side", (value) => {
+    expectInvalid(() => validateQuestion(noul({ true: value, false: "no" })), "question.criteria.true", "non-empty string");
+    expectInvalid(() => validateQuestion(noul({ true: "yes", false: value })), "question.criteria.false", "non-empty string");
   });
 });
 
@@ -529,5 +557,50 @@ describe("resolveOptions", () => {
     expect(validationMessage(() => resolveOptions(requestWith("execution.retries", "3")))).toBe(
       'execution.retries must be an integer >= 0, got "3".',
     );
+  });
+});
+
+describe("validateRequestAndResolve", () => {
+  it("returns the same request object and its resolved options", () => {
+    const request = { ...baseRequest(), chunking: { overlap: 0.2 }, execution: { retries: 1 } };
+    const { request: validated, options } = validateRequestAndResolve(request);
+    expect(validated).toBe(request);
+    expect(options).toEqual(resolveOptions(request as unknown as JevInfiniteCTXRequest));
+    expect(options.chunking.overlap).toBe(0.2);
+    expect(options.execution.retries).toBe(1);
+  });
+
+  it("rejects what validateRequest rejects", () => {
+    expectInvalid(() => validateRequestAndResolve({ ...baseRequest(), input: " " }), "input");
+    expectInvalid(() => validateRequestAndResolve({ ...baseRequest(), chunking: { overlap: 0.9 } }), "chunking.overlap");
+  });
+
+  // Regression: validateRequest used to resolve the options and discard them, so
+  // decide() resolved them a second time and read every option getter twice.
+  it("reads each option section and option value exactly once", () => {
+    let sectionReads = 0;
+    let overlapReads = 0;
+    const chunking = {};
+    Object.defineProperty(chunking, "overlap", {
+      enumerable: true,
+      get() {
+        overlapReads++;
+        return 0.1;
+      },
+    });
+    const request = baseRequest();
+    Object.defineProperty(request, "chunking", {
+      enumerable: true,
+      get() {
+        sectionReads++;
+        return chunking;
+      },
+    });
+
+    const { options } = validateRequestAndResolve(request);
+
+    expect(options.chunking.overlap).toBe(0.1);
+    expect(sectionReads).toBe(1);
+    expect(overlapReads).toBe(1);
   });
 });

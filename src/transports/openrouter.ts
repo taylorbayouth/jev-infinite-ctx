@@ -24,33 +24,38 @@ import {
 
 export const OPENROUTER_DEFAULT_MODEL = "typesafe/jev-1.13";
 
+/**
+ * Every field also accepts an explicit `undefined`, read as omitted, so
+ * options built from possibly-unset values (`process.env.X`) compile under
+ * `exactOptionalPropertyTypes`.
+ */
 export interface OpenRouterJevTransportOptions {
   /** Default: process.env.OPENROUTER_API_KEY. */
-  apiKey?: string;
+  apiKey?: string | undefined;
   /** Default "https://openrouter.ai". A trailing slash is tolerated. */
-  baseUrl?: string;
+  baseUrl?: string | undefined;
   /** Default "typesafe/jev-1.13". */
-  defaultModel?: string;
+  defaultModel?: string | undefined;
   /** Default: the global fetch, looked up at request time. */
-  fetch?: typeof fetch;
+  fetch?: typeof fetch | undefined;
   /** Per decision request, including reading the body. Default 60_000. */
-  timeoutMs?: number;
+  timeoutMs?: number | undefined;
   /** Extra request headers. They cannot replace Authorization or Content-Type. */
-  headers?: Record<string, string>;
+  headers?: Record<string, string> | undefined;
   /** Sent as X-OpenRouter-Title and X-Title (app attribution). */
-  appName?: string;
+  appName?: string | undefined;
   /** Sent as HTTP-Referer (app attribution). */
-  appUrl?: string;
+  appUrl?: string | undefined;
   /** Sent as body.session_id (observability grouping). */
-  sessionId?: string;
+  sessionId?: string | undefined;
   /** Sent as body.user (per-end-user attribution). */
-  user?: string;
+  user?: string | undefined;
   /** Explicit context window in tokens; skips the metadata lookup. */
-  contextWindow?: number;
+  contextWindow?: number | undefined;
   /** Default true: look the model up in GET {baseUrl}/api/v1/models?output_modalities=decisions. */
-  resolveContextWindow?: boolean;
+  resolveContextWindow?: boolean | undefined;
   /** Deadline for the model catalog request. Default 5_000. */
-  metadataTimeoutMs?: number;
+  metadataTimeoutMs?: number | undefined;
 }
 
 const LABEL = "OpenRouter";

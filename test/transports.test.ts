@@ -1,8 +1,13 @@
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { inspect } from "node:util";
+import ts from "typescript";
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import fc from "fast-check";
 import {
   classifyHttpError,
   isContextLimitMessage,
+  mergeHeaders,
   parseNativeResponse,
   parseRetryAfter,
   postDecision,
@@ -10,8 +15,17 @@ import {
 } from "../src/transports/http.js";
 import { OPENROUTER_DEFAULT_MODEL, OpenRouterJevTransport } from "../src/transports/openrouter.js";
 import { DIRECT_DEFAULT_MODEL, DirectJevTransport } from "../src/transports/direct.js";
-import { JevAbortError, JevProviderError, JevValidationError, type ProviderErrorKind } from "../src/errors.js";
-import type { ChoiceQuestion, JsonObject, NativeJevRequest } from "../src/types.js";
+import { decide } from "../src/decide.js";
+import { MIN_STATE_TOKENS } from "../src/defaults.js";
+import {
+  JevAbortError,
+  JevChunkFailedError,
+  JevContextBudgetError,
+  JevProviderError,
+  JevValidationError,
+  type ProviderErrorKind,
+} from "../src/errors.js";
+import type { ChoiceQuestion, JsonObject, NativeJevRequest, NoulQuestion } from "../src/types.js";
 
 // ---------------------------------------------------------------------------
 // Fixtures and helpers
@@ -153,8 +167,8 @@ function wireBody(state: string = STATE): JsonObject {
   return { model: "typesafe/jev-1.13", state, questions: { decision: { type: "noul", instructions: "Is it?" } } };
 }
 
-/** Length of the shortest state echo redaction guarantees to remove (2 x 16-char probe - 1). */
-const GUARANTEED_RUN = 31;
+/** Shortest run shared with the state that redaction guarantees to remove from `body` (MIN_ECHO_RUN). */
+const GUARANTEED_RUN = 8;
 
 /** True when `text` still contains a run of `minRun` characters that also occurs in `secret`. */
 function sharesRun(text: string, secret: string, minRun = GUARANTEED_RUN): boolean {
@@ -266,6 +280,12 @@ describe("isContextLimitMessage", () => {
     "state size exceeded",
     "Please reduce the length of the messages or completion.",
     "exceeds maximum context",
+    // F17: a size stated as a count, without "maximum" or a context noun.
+    "state exceeds 32000 tokens",
+    "input exceeded 128,000 characters",
+    "Request exceeds 40000 tokens",
+    "String should have at most 128000 characters",
+    "ensure this value has at most 128000 characters",
   ])("detects %j", (message) => {
     expect(isContextLimitMessage(message)).toBe(true);
   });
@@ -286,6 +306,14 @@ describe("isContextLimitMessage", () => {
     "Insufficient credits",
     "Internal server error",
     "Provider returned error",
+    // F17 patterns must not catch output-token limits, rate limits, or small field limits.
+    "max_tokens exceeds 4096 tokens",
+    "max_completion_tokens should be at most 4096 tokens",
+    "Rate limit exceeded: 100000 tokens per minute",
+    "Usage exceeded 40000 tokens/min",
+    "String should have at most 64 characters",
+    "criteria keys exceed 64 characters",
+    "exceeds 12 tokens",
     "",
   ])("does not flag %j", (message) => {
     expect(isContextLimitMessage(message)).toBe(false);
@@ -322,6 +350,23 @@ describe("classifyHttpError", () => {
     [500, openRouterError("Model is overloaded, try again", 500), "overloaded", true],
     [418, "I'm a teapot", "unknown", false],
     [409, "Conflict", "unknown", false],
+    // F17: over-length wordings that name a count rather than "maximum" or "context".
+    [400, openRouterError("state exceeds 32000 tokens"), "context_limit", false],
+    [
+      422,
+      JSON.stringify({
+        detail: [
+          {
+            type: "string_too_long",
+            loc: ["body", "state"],
+            msg: "String should have at most 128000 characters",
+            ctx: { max_length: 128000 },
+          },
+        ],
+      }),
+      "context_limit",
+      false,
+    ],
   ];
 
   it.each(CASES)("HTTP %d with body %j -> %s (retryable %s)", (status, body, kind, retryable) => {
@@ -395,7 +440,9 @@ describe("classifyHttpError", () => {
     const body = JSON.stringify({ error: { message: `Invalid state: ${STATE}`, metadata: { raw: STATE } } });
     const error = classifyHttpError(400, body, undefined, "P", STATE);
     expectNoState(error);
-    expect(error.message).toContain("[redacted]");
+    // With a state, the message never quotes provider text (F01); the kind
+    // ignores the echo's "context window" and "too many tokens" (F16).
+    expect(error.message).toBe("P request failed with HTTP 400 (bad_request)");
     expect(error.body).toContain("[redacted]");
   });
 
@@ -409,7 +456,7 @@ describe("classifyHttpError", () => {
     const body = `0123456789-=+*&X${p}${q}`;
     const error = classifyHttpError(500, body, undefined, "P", state);
     expect(error.body).toBe("0123456789-=+*&[redacted]");
-    expect(error.message).toBe("P request failed with HTTP 500 (server): 0123456789-=+*&[redacted]");
+    expect(error.message).toBe("P request failed with HTTP 500 (server)");
   });
 
   it("replaces adjacent echoes of different parts of the state with a single marker", () => {
@@ -658,8 +705,8 @@ describe("postDecision", () => {
     const error = await providerErrorOf(postDecision(httpConfig(fetchMock), wireBody()));
     expect(error.kind).toBe(kind);
     expect(error.status).toBe(status);
-    expect(error.message).toContain("TestProvider");
-    expect(error.message).toContain(message);
+    // Provider text stays on `body`; the message never quotes it for a request with state (F01).
+    expect(error.message).toBe(`TestProvider request failed with HTTP ${status} (${kind})`);
   });
 
   it("carries Retry-After (seconds and HTTP-date) onto the error", async () => {
@@ -686,7 +733,8 @@ describe("postDecision", () => {
       expect(error.status).toBe(429);
       expect(error.retryable).toBe(true);
       expect(error.retryAfterMs).toBe(2_000);
-      expect(error.message).toContain("Rate limit exceeded upstream");
+      expect(error.message).toBe("TestProvider request failed with HTTP 429 (rate_limit)");
+      expect(error.body).toContain("Rate limit exceeded upstream");
     });
 
     it.each([
@@ -867,9 +915,7 @@ describe("postDecision", () => {
       const fetchMock = fetchAlways(() => textResponse(text, { status: 400 }));
       const error = await providerErrorOf(postDecision(httpConfig(fetchMock), wireBody()));
       expect(error.body).toBe(text);
-      expect(error.message).toBe(
-        "TestProvider request failed with HTTP 400 (bad_request): questions.decision.criteria must have 2 options",
-      );
+      expect(error.message).toBe("TestProvider request failed with HTTP 400 (bad_request)");
     });
 
     it("property: an echoed state never survives in message or body", async () => {
@@ -1155,7 +1201,7 @@ describe("OpenRouterJevTransport", () => {
       );
       const error = await providerErrorOf(transport(fetchMock).decide(request()));
       expect(error.kind).toBe("context_limit");
-      expect(error.message).toMatch(/^OpenRouter request failed with HTTP 400 \(context_limit\): /);
+      expect(error.message).toBe("OpenRouter request failed with HTTP 400 (context_limit)");
       expectNoState(error);
     });
   });
@@ -1374,7 +1420,7 @@ describe("DirectJevTransport", () => {
     const error = await providerErrorOf(transport(fetchMock).decide(request()));
     expect(error.kind).toBe("rate_limit");
     expect(error.retryAfterMs).toBe(4_000);
-    expect(error.message).toBe("TypeSafe request failed with HTTP 429 (rate_limit): Too many requests");
+    expect(error.message).toBe("TypeSafe request failed with HTTP 429 (rate_limit)");
   });
 
   it("detects a context-limit 422 and keeps the state out of the error", async () => {
@@ -1397,4 +1443,406 @@ describe("DirectJevTransport", () => {
     controller.abort();
     expect(await rejectionOf(pending)).toBeInstanceOf(JevAbortError);
   });
+});
+
+// ---------------------------------------------------------------------------
+// Regression tests for review findings
+// ---------------------------------------------------------------------------
+
+/**
+ * `text` and each level of JSON unescaping of it, whitespace collapsed: an
+ * oracle, written independently of http.ts, for where an echo can hide.
+ */
+function unescapedViews(text: string): string[] {
+  const controls: Record<string, string> = { b: "\b", f: "\f", n: "\n", r: "\r", t: "\t" };
+  const views: string[] = [];
+  let current = text;
+  for (let level = 0; level <= 3; level += 1) {
+    views.push(current.replace(/\s+/g, " "));
+    const next = current.replace(/\\(?:u([0-9a-fA-F]{4})|(["\\/bfnrt]))/g, (_match, hex?: string, char?: string) =>
+      hex !== undefined ? String.fromCharCode(Number.parseInt(hex, 16)) : (controls[char!] ?? char!),
+    );
+    if (next === current) break;
+    current = next;
+  }
+  return views;
+}
+
+/** True when some unescaped view of `text` shares a run of `minRun` characters with `state`. */
+function leaksState(text: string, state: string, minRun = GUARANTEED_RUN): boolean {
+  const flat = state.replace(/\s+/g, " ");
+  return unescapedViews(text).some((view) => sharesRun(view, flat, minRun));
+}
+
+const NOUL: NoulQuestion = { type: "noul", instructions: "Does the record mention a diagnosis?" };
+
+describe("regression: short, nested, and re-escaped state echoes (F01)", () => {
+  const PATIENT =
+    "Patient record. SSN 123-45-6789, diagnosed with type 2 diabetes in March. Follow-up scheduled next quarter with endocrinology.";
+  const FRAGMENT_BODY = JSON.stringify({ error: { message: "Invalid input near 'SSN 123-45-6789, diagnosed' in state" } });
+
+  it("redacts a short mid-state fragment from body and never quotes it in the message", async () => {
+    const fetchMock = fetchAlways(() => textResponse(FRAGMENT_BODY, { status: 400 }));
+    const error = await providerErrorOf(postDecision(httpConfig(fetchMock), wireBody(PATIENT)));
+    expect(error.message).toBe("TestProvider request failed with HTTP 400 (bad_request)");
+    expect(error.body).toBe(JSON.stringify({ error: { message: "Invalid input near '[redacted]' in state" } }));
+  });
+
+  it("keeps the fragment out of the JevChunkFailedError that decide() throws", async () => {
+    const transport = new DirectJevTransport({
+      apiKey: "ts-test",
+      fetch: fetchAlways(() => textResponse(FRAGMENT_BODY, { status: 400 })),
+    });
+    const error = await rejectionOf(decide({ input: PATIENT, question: NOUL, provider: { transport } }));
+    expect(error).toBeInstanceOf(JevChunkFailedError);
+    const message = (error as Error).message;
+    expect(message).toContain("TypeSafe request failed with HTTP 400 (bad_request)");
+    expect(message).not.toMatch(/SSN|123-45-6789|diagnosed|Invalid input/);
+  });
+
+  it("redacts a multi-line state double-escaped inside OpenRouter's metadata.raw", async () => {
+    const state = [
+      "Name: John Q. Doe",
+      "SSN: 123-45-6789",
+      "DOB: 1970-01-02",
+      "Phone: +1 555 0100",
+      'Notes: patient said "no known allergies" at intake.',
+    ].join("\n");
+    // The upstream provider echoes the state in its own JSON error, and
+    // OpenRouter nests that raw body as a string.
+    const nested = (message: string): unknown => ({
+      error: {
+        code: 400,
+        message: "Provider returned error",
+        metadata: { raw: JSON.stringify({ error: { message } }), provider_name: "TypeSafe" },
+      },
+    });
+    const fetchMock = fetchAlways(() => jsonResponse(nested(`bad state: ${state}`), { status: 400 }));
+    const error = await providerErrorOf(
+      new OpenRouterJevTransport({ apiKey: "sk-or-test", fetch: fetchMock }).decide(request({ state })),
+    );
+    expect(error.message).toBe("OpenRouter request failed with HTTP 400 (bad_request)");
+    expect(error.body).toBe(JSON.stringify(nested("bad state: [redacted]")));
+  });
+
+  it("redacts an echo with Go's \\u003c, \\u003e, and \\u0026 escapes", () => {
+    const state = "<b>Name:</b> John Q. Doe<br><b>SSN:</b> 123-45-6789<br><b>Dx:</b> HIV & hepatitis C<br>";
+    const goEscaped = JSON.stringify({ error: `bad state ${state}` })
+      .replace(/</g, "\\u003c")
+      .replace(/>/g, "\\u003e")
+      .replace(/&/g, "\\u0026");
+    const error = classifyHttpError(400, goEscaped, undefined, "P", state);
+    expect(error.body).toBe('{"error":"bad state [redacted]"}');
+    expect(error.message).toBe("P request failed with HTTP 400 (bad_request)");
+  });
+
+  it("redacts an echo with uppercase \\u escapes (.NET style)", () => {
+    const state = "Zoë Müller, SSN 123-45-6789, née Schmidt, lives in Zürich.";
+    const escaped = JSON.stringify({ error: `bad state ${state}` }).replace(
+      /[\u0080-￿]/g,
+      (c) => `\\u${c.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0")}`,
+    );
+    expect(classifyHttpError(400, escaped, undefined, "P", state).body).toBe('{"error":"bad state [redacted]"}');
+  });
+
+  it("redacts a 12-character name quoted on its own", () => {
+    const state = "Referral letter.\nPatient: Maria Garcia\nReason: chest pain on exertion, two weeks.";
+    const text = JSON.stringify({ detail: "Unknown entity 'Maria Garcia'" });
+    expect(classifyHttpError(422, text, undefined, "P", state).body).toBe(
+      JSON.stringify({ detail: "Unknown entity '[redacted]'" }),
+    );
+  });
+
+  it("redacts before truncating, so the cut cannot leave a short unredacted tail", () => {
+    const text = `${"x".repeat(1985)}${PATIENT} trailing`;
+    const error = classifyHttpError(500, text, undefined, "P", PATIENT);
+    expect(error.body!.startsWith(`${"x".repeat(1985)}[redacted]`)).toBe(true);
+    expect(error.body!.length).toBeLessThanOrEqual(2000);
+    expect(leaksState(error.body!, PATIENT)).toBe(false);
+  });
+
+  it("property: an 8+ character fragment, raw, JSON-escaped, nested, or \\u-escaped, never survives", async () => {
+    await fc.assert(
+      fc.asyncProperty(
+        fc.string({ minLength: 40, maxLength: 300 }),
+        fc.nat(),
+        fc.integer({ min: 8, max: 40 }),
+        fc.constantFrom("raw", "json", "json-in-json", "upper-ascii-json"),
+        fc.string({ maxLength: 30 }),
+        async (state, offset, length, mode, prefix) => {
+          const start = offset % (state.length - length + 1);
+          const message = `${prefix}${state.slice(start, start + length)} tail`;
+          const json = JSON.stringify({ error: { message } });
+          const bodyText =
+            mode === "raw"
+              ? `bad input: ${message}`
+              : mode === "json"
+                ? json
+                : mode === "json-in-json"
+                  ? JSON.stringify({ error: { message: "Provider returned error", metadata: { raw: json } } })
+                  : json.replace(/[\u0080-￿]/g, (c) => `\\u${c.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0")}`);
+          const fetchMock = fetchAlways(() => textResponse(bodyText, { status: 400 }));
+          const error = await providerErrorOf(postDecision(httpConfig(fetchMock), wireBody(state)));
+          expect(error.message).toMatch(/^TestProvider request failed with HTTP 400 \((?:bad_request|context_limit)\)$/);
+          expect(leaksState(error.body ?? "", state)).toBe(false);
+        },
+      ),
+      { numRuns: 300 },
+    );
+  });
+});
+
+describe("regression: header validation never exposes the value (F15)", () => {
+  const SECRET = "sk-F15-TOP-SECRET-KEY";
+
+  function thrown(fn: () => unknown): Error {
+    try {
+      fn();
+    } catch (error) {
+      expect(error).toBeInstanceOf(JevValidationError);
+      return error as Error;
+    }
+    throw new Error("expected a throw");
+  }
+
+  /** What console.error prints, plus every message and stack on the cause chain. */
+  function everythingLogged(error: Error): string {
+    const parts = [inspect(error, { depth: 10 })];
+    for (let current: unknown = error; current instanceof Error; current = current.cause) {
+      parts.push(current.message, String(current.stack));
+    }
+    return parts.join("\n");
+  }
+
+  it.each([
+    ["LF", `${SECRET}\nX-Injected: 1`],
+    ["CR", `${SECRET}\rrest`],
+    ["NUL", `${SECRET}\u0000rest`],
+  ])("DirectJevTransport rejects an API key containing %s without echoing it", (_label, apiKey) => {
+    const error = thrown(() => new DirectJevTransport({ apiKey, fetch: fetchAlways(() => jsonResponse({})) }));
+    expect(error.message).toBe("TypeSafe: the API key contains a character HTTP headers do not allow (such as CR, LF, or NUL)");
+    expect(error.cause).toBeUndefined();
+    expect(everythingLogged(error)).not.toContain(SECRET);
+  });
+
+  it("OpenRouterJevTransport rejects an API key containing LF without echoing it", () => {
+    const error = thrown(
+      () => new OpenRouterJevTransport({ apiKey: `${SECRET}\nX-Injected: 1`, fetch: fetchAlways(() => jsonResponse({})) }),
+    );
+    expect(error.message).toBe("OpenRouter: the API key contains a character HTTP headers do not allow (such as CR, LF, or NUL)");
+    expect(everythingLogged(error)).not.toContain(SECRET);
+  });
+
+  it("names a caller header, but not its value", () => {
+    const error = thrown(
+      () =>
+        new OpenRouterJevTransport({
+          apiKey: "sk-or-test",
+          fetch: fetchAlways(() => jsonResponse({})),
+          headers: { "X-Custom-Auth": `${SECRET}\nabc` },
+        }),
+    );
+    expect(error.message).toBe('OpenRouter: headers["X-Custom-Auth"] is not a valid HTTP header name and value');
+    expect(everythingLogged(error)).not.toContain(SECRET);
+  });
+
+  it("names another fixed header, but not its value", () => {
+    const error = thrown(
+      () =>
+        new OpenRouterJevTransport({
+          apiKey: "sk-or-test",
+          fetch: fetchAlways(() => jsonResponse({})),
+          appName: `App ${SECRET}\nX`,
+        }),
+    );
+    expect(error.message).toBe(
+      "OpenRouter: the X-OpenRouter-Title header value contains a character HTTP headers do not allow (such as CR, LF, or NUL)",
+    );
+    expect(everythingLogged(error)).not.toContain(SECRET);
+  });
+
+  it("mergeHeaders carries nothing on the cause chain", () => {
+    const error = thrown(() => mergeHeaders(undefined, { Authorization: `Bearer ${SECRET}\nX: y` }, "test"));
+    expect(error.cause).toBeUndefined();
+    expect(everythingLogged(error)).not.toContain(SECRET);
+  });
+});
+
+describe("regression: echoed document text does not choose the error kind (F16)", () => {
+  const LLM_DOC =
+    "Release notes. We raised the model's context window to 200k tokens and fixed the tokenizer cache. " +
+    "Nothing else in this release changes the public API.";
+  const CPP_DOC =
+    "Style guide. Prefer a free-function operator overload over a member when the left operand is not the class. " +
+    "Keep overloaded operators consistent with the built-in semantics.";
+
+  /** FastAPI/pydantic-style 422: the rejected object (the whole request body) is echoed as `input`. */
+  function validationEcho(requestBody: unknown): string {
+    return JSON.stringify({
+      detail: [
+        {
+          type: "extra_forbidden",
+          loc: ["body", "questions", "decision", "weight"],
+          msg: "Extra inputs are not permitted",
+          input: requestBody,
+        },
+      ],
+    });
+  }
+
+  it("a 422 that echoes a state mentioning the context window is bad_request", () => {
+    const error = classifyHttpError(422, validationEcho(wireBody(LLM_DOC)), undefined, "P", LLM_DOC);
+    expect(error.kind).toBe("bad_request");
+    expect(error.retryable).toBe(false);
+  });
+
+  it("a 409 that echoes a state mentioning operator overloads is unknown and not retried", () => {
+    const body = JSON.stringify({ error: { message: "Conflict: idempotency key reused" }, request: wireBody(CPP_DOC) });
+    const error = classifyHttpError(409, body, undefined, "P", CPP_DOC);
+    expect(error.kind).toBe("unknown");
+    expect(error.retryable).toBe(false);
+  });
+
+  it("a code-less 2xx error object that echoes the state is unknown", () => {
+    const body = JSON.stringify({ error: { message: "Request rejected", request: wireBody(CPP_DOC) } });
+    expect(classifyHttpError(undefined, body, undefined, "P", CPP_DOC).kind).toBe("unknown");
+  });
+
+  it("postDecision reports a 422 echo of the request as bad_request", async () => {
+    const fetchMock = vi.fn<typeof fetch>(
+      async (_input, init) => new Response(validationEcho(JSON.parse(String(init?.body))), { status: 422 }),
+    );
+    const error = await providerErrorOf(postDecision(httpConfig(fetchMock), wireBody(LLM_DOC)));
+    expect(error.kind).toBe("bad_request");
+  });
+
+  it("still reads the provider's own wording when the document shares a short run of it", () => {
+    const doc = "Planning notes: the maximum context length is the most important model limit, so we track it per model.";
+    const body = JSON.stringify({ error: { code: 400, message: "This endpoint's maximum context length is 32768 tokens." } });
+    expect(classifyHttpError(400, body, undefined, "P", doc).kind).toBe("context_limit");
+  });
+
+  it("decide() fails a deterministic 422 echo at once instead of re-chunking to JevContextBudgetError", async () => {
+    // Every sentence mentions the context window, so every chunk's echo would match.
+    const sentence = "Section notes: the context window of the model was compared against the baseline run. ";
+    const input = sentence.repeat(250);
+    const fetchMock = vi.fn<typeof fetch>(
+      async (_input, init) => new Response(validationEcho(JSON.parse(String(init?.body))), { status: 422 }),
+    );
+    const transport = new DirectJevTransport({ apiKey: "ts-test", fetch: fetchMock });
+    const error = await rejectionOf(decide({ input, question: NOUL, provider: { transport } }));
+    expect(error).not.toBeInstanceOf(JevContextBudgetError);
+    expect(error).toBeInstanceOf(JevChunkFailedError);
+    expect(((error as JevChunkFailedError).cause as JevProviderError).kind).toBe("bad_request");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("regression: count-based over-length wordings re-chunk (F17)", () => {
+  const CHOICE: ChoiceQuestion = {
+    type: "choice",
+    instructions: "What is the text mostly about?",
+    criteria: { tree: "Trees.", rock: "Rocks.", other: "Neither." },
+  };
+
+  /** A transport that rejects states longer than `maxStateChars` with a 400 carrying `message`. */
+  function rejectingLongStates(message: string, maxStateChars: number): DirectJevTransport {
+    return new DirectJevTransport({
+      apiKey: "ts-test",
+      fetch: async (_input, init) => {
+        const body = JSON.parse(String(init?.body)) as { state: string };
+        if (body.state.length > maxStateChars) return jsonResponse({ error: { message } }, { status: 400 });
+        return jsonResponse({
+          model: "jev-latest",
+          answers: {
+            decision: { type: "choice", choice: "tree", probabilities: { tree: 0.8, rock: 0.1, other: 0.1 }, confidence: 0.7 },
+          },
+        });
+      },
+    });
+  }
+
+  it.each(["state exceeds the model's context window", "state exceeds 32000 tokens"])(
+    "re-chunks after %j and succeeds",
+    async (message) => {
+      const result = await decide({
+        input: "oak tree grows in the forest. ".repeat(400),
+        question: CHOICE,
+        provider: { transport: rejectingLongStates(message, 3000) },
+        chunking: { maxStateTokens: MIN_STATE_TOKENS * 8 },
+        execution: { retryBaseDelayMs: 0 },
+      });
+      expect(result.usage.rechunks).toBeGreaterThan(0);
+    },
+  );
+});
+
+describe("regression: transport options accept an explicit undefined (F23)", () => {
+  it("options built from possibly-unset values typecheck under exactOptionalPropertyTypes", () => {
+    const consumerPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "__transport_options_consumer__.ts");
+    const consumerSource = `
+      import { OpenRouterJevTransport } from "../src/transports/openrouter.js";
+      import { DirectJevTransport } from "../src/transports/direct.js";
+
+      declare function maybe<T>(): T | undefined;
+
+      // README "OpenRouter Decisions API (default)" example, plus every other option.
+      export const openRouter = new OpenRouterJevTransport({
+        apiKey: process.env.OPENROUTER_API_KEY,
+        baseUrl: process.env.OPENROUTER_BASE_URL,
+        defaultModel: maybe<string>(),
+        fetch: maybe<typeof fetch>(),
+        timeoutMs: maybe<number>(),
+        headers: maybe<Record<string, string>>(),
+        appName: maybe<string>(),
+        appUrl: maybe<string>(),
+        sessionId: maybe<string>(),
+        user: maybe<string>(),
+        contextWindow: maybe<number>(),
+        resolveContextWindow: maybe<boolean>(),
+        metadataTimeoutMs: maybe<number>(),
+      });
+
+      export const direct = new DirectJevTransport({
+        apiKey: process.env.TYPESAFE_API_KEY,
+        baseUrl: maybe<string>(),
+        path: maybe<string>(),
+        defaultModel: maybe<string>(),
+        fetch: maybe<typeof fetch>(),
+        timeoutMs: maybe<number>(),
+        headers: maybe<Record<string, string>>(),
+        contextWindow: maybe<number>(),
+      });
+    `;
+    const options: ts.CompilerOptions = {
+      target: ts.ScriptTarget.ES2022,
+      lib: ["lib.es2022.d.ts", "lib.dom.d.ts"],
+      module: ts.ModuleKind.NodeNext,
+      moduleResolution: ts.ModuleResolutionKind.NodeNext,
+      strict: true,
+      exactOptionalPropertyTypes: true,
+      noEmit: true,
+      skipLibCheck: true,
+      types: ["node"],
+    };
+    const host = ts.createCompilerHost(options);
+    const fileExists = host.fileExists.bind(host);
+    const readFile = host.readFile.bind(host);
+    const getSourceFile = host.getSourceFile.bind(host);
+    host.fileExists = (file) => file === consumerPath || fileExists(file);
+    host.readFile = (file) => (file === consumerPath ? consumerSource : readFile(file));
+    host.getSourceFile = (file, language, onError, create) =>
+      file === consumerPath
+        ? ts.createSourceFile(file, consumerSource, language, true)
+        : getSourceFile(file, language, onError, create);
+
+    const program = ts.createProgram([consumerPath], options, host);
+    const consumer = program.getSourceFile(consumerPath);
+    expect(consumer).toBeDefined();
+    // Only the consumer's diagnostics count: the package itself builds without the flag.
+    const diagnostics = [...program.getSyntacticDiagnostics(consumer), ...program.getSemanticDiagnostics(consumer)].map(
+      (diagnostic) => ts.flattenDiagnosticMessageText(diagnostic.messageText, "\n"),
+    );
+    expect(diagnostics).toEqual([]);
+  }, 60_000);
 });

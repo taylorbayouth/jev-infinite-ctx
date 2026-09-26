@@ -1,5 +1,5 @@
 /**
- * C3 — Cross-Chunk Confidence Calibration (spec 11).
+ * C3: Cross-Chunk Confidence Calibration (spec 11).
  *
  * C3 is a bounded, heuristic correction (spec 11.7): it may raise the base
  * confidence toward `cap` when many chunks agree, and never lowers it. It is
@@ -34,10 +34,13 @@ export interface C3Result {
 }
 
 /**
- * N_eff = 1 + Σ_{i≥2} uniqueTokens_i / tokens_i (spec 11.3), derived from
- * the actual unique-token counts rather than the 1 + (N − 1)(1 − r)
- * approximation. Each later chunk contributes only the fraction of its
- * tokens that it did not share with its predecessor.
+ * N_eff = Σ_i uniqueTokens_i / max_i tokens_i, clamped to [1, N] (spec 11.3):
+ * the new content across all chunks, measured in units of the largest
+ * chunk. It is derived from the actual unique-token counts, the same ones
+ * that set the weights, so a chunk counts in proportion to the new content
+ * it carries: a short final chunk adds only its share of a full chunk. For
+ * N chunks of equal size with overlap ratio r it equals the approximation
+ * 1 + (N − 1)(1 − r).
  */
 export function effectiveChunkCount(
   chunks: ReadonlyArray<Pick<ChunkSpan, "tokens" | "uniqueTokens">>,
@@ -45,16 +48,19 @@ export function effectiveChunkCount(
   if (chunks.length === 0) {
     throw new JevInfiniteCTXError("effectiveChunkCount() requires at least one chunk.");
   }
-  return chunks.slice(1).reduce((n, chunk, offset) => {
-    const { tokens, uniqueTokens } = chunk;
+  let uniqueSum = 0;
+  let largest = 1;
+  chunks.forEach(({ tokens, uniqueTokens }, index) => {
     if (!Number.isFinite(tokens) || tokens < 0 || !Number.isFinite(uniqueTokens) || uniqueTokens < 0) {
       throw new JevInfiniteCTXError(
-        `Chunk ${offset + 1} token counts must be finite and >= 0 (tokens ${tokens}, uniqueTokens ${uniqueTokens}).`,
+        `Chunk ${index} token counts must be finite and >= 0 (tokens ${tokens}, uniqueTokens ${uniqueTokens}).`,
       );
     }
-    // A chunk never adds more than one chunk's worth of new content, so N_eff <= N.
-    return n + Math.min(1, uniqueTokens / Math.max(1, tokens));
-  }, 1);
+    uniqueSum += uniqueTokens;
+    largest = Math.max(largest, tokens);
+  });
+  // No chunk adds more than one chunk's worth of new content, so N_eff <= N.
+  return Math.min(chunks.length, Math.max(1, uniqueSum / largest));
 }
 
 /**

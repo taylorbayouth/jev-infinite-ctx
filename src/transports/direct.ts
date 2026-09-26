@@ -21,23 +21,28 @@ import {
 
 export const DIRECT_DEFAULT_MODEL = "jev-latest";
 
+/**
+ * Every field also accepts an explicit `undefined`, read as omitted, so
+ * options built from possibly-unset values (`process.env.X`) compile under
+ * `exactOptionalPropertyTypes`.
+ */
 export interface DirectJevTransportOptions {
   /** Default: process.env.TYPESAFE_API_KEY. */
-  apiKey?: string;
+  apiKey?: string | undefined;
   /** Default "https://api.typesafe.ai". A trailing slash is tolerated. */
-  baseUrl?: string;
+  baseUrl?: string | undefined;
   /** Default "/v1/systemone". A missing leading slash is added. */
-  path?: string;
+  path?: string | undefined;
   /** Default "jev-latest". */
-  defaultModel?: string;
+  defaultModel?: string | undefined;
   /** Default: the global fetch, looked up at request time. */
-  fetch?: typeof fetch;
+  fetch?: typeof fetch | undefined;
   /** Per decision request, including reading the body. Default 60_000. */
-  timeoutMs?: number;
+  timeoutMs?: number | undefined;
   /** Extra request headers. They cannot replace Authorization or Content-Type. */
-  headers?: Record<string, string>;
+  headers?: Record<string, string> | undefined;
   /** Context window in tokens. Default 32_000 (TypeSafe documents a 32K state limit). */
-  contextWindow?: number;
+  contextWindow?: number | undefined;
 }
 
 const LABEL = "TypeSafe";

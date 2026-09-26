@@ -10,18 +10,24 @@
 // ---------------------------------------------------------------------------
 
 export type JsonPrimitive = string | number | boolean | null;
-export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
+/**
+ * Arrays are readonly so `as const` questions and shared rubric constants
+ * type-check; the package never mutates a caller's question. An object value
+ * must be a type alias or literal: an `interface` has no index signature, so
+ * TypeScript does not treat it as a JsonObject.
+ */
+export type JsonValue = JsonPrimitive | readonly JsonValue[] | { [key: string]: JsonValue };
 export type JsonObject = { [key: string]: JsonValue };
 
 /** Jev accepts a plain string or a structured JSON object/array for instructions. */
-export type JevInstructions = string | JsonObject | JsonValue[];
+export type JevInstructions = string | JsonObject | readonly JsonValue[];
 
 /**
  * A single criterion (choice option description, score level, noul true/false
  * description). Jev accepts a string or a structured object such as
  * `{ what, not_for, examples }`.
  */
-export type JevCriterion = string | JsonObject | JsonValue[];
+export type JevCriterion = string | JsonObject | readonly JsonValue[];
 
 // ---------------------------------------------------------------------------
 // Questions (spec 4, 5.2)
@@ -33,7 +39,7 @@ export interface NoulQuestion {
   type: "noul";
   instructions: JevInstructions;
   /** Optional. When present, both `true` and `false` are required. */
-  criteria?: { true: JevCriterion; false: JevCriterion };
+  criteria?: { true: JevCriterion; false: JevCriterion } | undefined;
 }
 
 export interface ChoiceQuestion<K extends string = string> {
@@ -47,7 +53,7 @@ export interface ScoreQuestion {
   type: "score";
   instructions: JevInstructions;
   /** Ordered rubric, lowest level first. 2 to 10 levels. */
-  criteria: JevCriterion[];
+  criteria: readonly JevCriterion[];
 }
 
 export type JevQuestion = NoulQuestion | ChoiceQuestion<string> | ScoreQuestion;
@@ -64,7 +70,7 @@ export interface NativeJevRequest {
   /** Keyed questions, exactly as Jev's Decisions API expects them. */
   questions: Record<string, JevQuestion>;
   /** Aborts the in-flight request. Transports must honor it. */
-  signal?: AbortSignal;
+  signal?: AbortSignal | undefined;
 }
 
 export interface NativeNoulAnswer {
@@ -92,10 +98,10 @@ export interface NativeScoreAnswer {
 export type NativeJevAnswer = NativeNoulAnswer | NativeChoiceAnswer | NativeScoreAnswer;
 
 export interface NativeJevUsage {
-  inputTokens?: number;
-  outputTokens?: number;
+  inputTokens?: number | undefined;
+  outputTokens?: number | undefined;
   /** USD, when the provider reports it (OpenRouter does, TypeSafe direct does not). */
-  costUsd?: number;
+  costUsd?: number | undefined;
 }
 
 /** Normalized (camelCase) response every transport returns. */
@@ -148,86 +154,99 @@ export interface Tokenizer {
 
 // ---------------------------------------------------------------------------
 // Options (spec 5, 14)
+//
+// Every optional input field also accepts an explicit `undefined`, read as
+// omitted, so options built from possibly-unset values (`process.env.X`)
+// compile under `exactOptionalPropertyTypes`.
 // ---------------------------------------------------------------------------
 
 export type AggregationMethod = "weighted_mean" | "mean" | "median" | "min" | "max";
 
 export interface ChunkingOptions {
   /** Overlap ratio of the usable chunk size. Default 0.05. Allowed range [0, 0.5]. */
-  overlap?: number;
+  overlap?: number | undefined;
   /**
    * "auto" (default) derives the state budget from the transport's context
    * window. A number caps the state budget; the effective budget is
    * min(number, auto budget).
    */
-  maxStateTokens?: "auto" | number;
+  maxStateTokens?: "auto" | number | undefined;
   /** Fraction of the remaining context held back as safety reserve. Default 0.08. Range [0, 0.5]. */
-  contextSafetyReserve?: number;
+  contextSafetyReserve?: number | undefined;
   /** Fixed token reserve for Jev's request scaffolding. Default 1024. */
-  protocolReserve?: number;
+  protocolReserve?: number | undefined;
   /** Prefer paragraph, sentence, whitespace boundaries before hard cuts. Default true. */
-  preferNaturalBoundaries?: boolean;
-  /** Optional guard: fail before calling Jev if the plan needs more chunks than this. */
-  maxChunks?: number;
+  preferNaturalBoundaries?: boolean | undefined;
+  /**
+   * Optional guard on the number of chunks. A first plan that exceeds it
+   * throws JevValidationError before any request. A re-chunk pass (after
+   * context-limit errors) that would exceed it throws JevContextBudgetError,
+   * and the requests of earlier passes have already been made and billed.
+   */
+  maxChunks?: number | undefined;
 }
 
 export interface ExecutionOptions {
   /** Maximum concurrent Jev requests. Default 4. */
-  maxConcurrency?: number;
+  maxConcurrency?: number | undefined;
   /** Retries per chunk for retryable failures (429, 5xx, overload, network). Default 3. */
-  retries?: number;
+  retries?: number | undefined;
   /** Base delay for exponential backoff. Default 500ms. */
-  retryBaseDelayMs?: number;
+  retryBaseDelayMs?: number | undefined;
   /** Maximum single backoff delay. Default 8000ms. */
-  retryMaxDelayMs?: number;
+  retryMaxDelayMs?: number | undefined;
   /** How many times to shrink the budget and re-chunk after a context-limit error. Default 4. */
-  maxRechunks?: number;
-  /** Multiplier applied to the state budget on each context-limit re-chunk. Default 0.75. */
-  rechunkShrinkFactor?: number;
+  maxRechunks?: number | undefined;
+  /**
+   * Multiplier applied on each context-limit re-chunk: the new budget is
+   * floor(min(current budget, failing chunk's estimated tokens) × factor).
+   * Default 0.75.
+   */
+  rechunkShrinkFactor?: number | undefined;
 }
 
 export interface ConfidenceOptions {
   /** "c3" (default) applies the C3 correction. "none" reports adjusted = base. */
-  method?: "c3" | "none";
+  method?: "c3" | "none" | undefined;
   /** C_cap. Default 0.98. Range (0, 1]. */
-  cap?: number;
+  cap?: number | undefined;
   /** λ saturation rate. Default 0.25. Must be > 0. */
-  lambda?: number;
+  lambda?: number | undefined;
   /** A_floor. Default 0.5. Range [0, 1). */
-  agreementFloor?: number;
+  agreementFloor?: number | undefined;
   /** γ gate exponent. Default 2.0. Must be > 0. */
-  agreementExponent?: number;
+  agreementExponent?: number | undefined;
 }
 
 export type BuiltInTransportName = "openrouter" | "direct";
 
 export interface ProviderOptions {
   /** Built-in transport name or any `JevTransport` implementation. Default "openrouter". */
-  transport?: BuiltInTransportName | JevTransport;
+  transport?: BuiltInTransportName | JevTransport | undefined;
   /** Model id. Defaults to the transport's `defaultModel`. */
-  model?: string;
+  model?: string | undefined;
   /**
    * API key for a built-in transport. Defaults to OPENROUTER_API_KEY
    * ("openrouter") or TYPESAFE_API_KEY ("direct") from the environment.
    * Ignored when `transport` is an object.
    */
-  apiKey?: string;
+  apiKey?: string | undefined;
 }
 
 export interface JevInfiniteCTXRequest<Q extends JevQuestion = JevQuestion> {
   input: string;
   question: Q;
-  aggregation?: AggregationMethod;
-  chunking?: ChunkingOptions;
-  confidence?: ConfidenceOptions;
-  execution?: ExecutionOptions;
-  provider?: ProviderOptions;
+  aggregation?: AggregationMethod | undefined;
+  chunking?: ChunkingOptions | undefined;
+  confidence?: ConfidenceOptions | undefined;
+  execution?: ExecutionOptions | undefined;
+  provider?: ProviderOptions | undefined;
   /** Token counter for budgeting. Defaults to the built-in heuristic tokenizer. */
-  tokenizer?: Tokenizer;
+  tokenizer?: Tokenizer | undefined;
   /** Cancels the whole operation, including in-flight requests. */
-  signal?: AbortSignal;
+  signal?: AbortSignal | undefined;
   /** Observability hook. Never receives source text. Exceptions thrown by the hook are swallowed. */
-  onEvent?: (event: JevInfiniteCTXEvent) => void;
+  onEvent?: ((event: JevInfiniteCTXEvent) => void) | undefined;
 }
 
 /** Fully resolved options after defaults are applied. */
@@ -286,7 +305,7 @@ export interface ChunkPlan {
   overlapRatio: number;
   /** Estimated tokens of the full input. */
   totalTokens: number;
-  /** N_eff = 1 + Σ_{i≥2} uniqueTokens_i / tokens_i (spec 11.3). */
+  /** N_eff = Σ_i uniqueTokens_i / max_i tokens_i, clamped to [1, N] (spec 11.3). */
   effectiveCount: number;
 }
 
@@ -326,7 +345,12 @@ export interface C3Components {
 }
 
 export interface ConfidenceInfo {
-  /** C_base. For choice/score: weighted mean of Jev's raw chunk confidences. For noul: |2·noul − 1|. */
+  /**
+   * C_base. For choice/score: the weighted mean of Jev's raw chunk
+   * confidences when every chunk reports one (source "jev"); otherwise
+   * 1 − H(P_agg)/ln K from the aggregate (source "derived"). For noul:
+   * |2·noul − 1| (source "derived").
+   */
   base: number;
   /** C_adjusted. Equals base for one chunk or when method is "none". Never below base, never raised above cap. */
   adjusted: number;
@@ -382,14 +406,19 @@ export interface ChunksInfo {
 }
 
 export interface UsageInfo {
-  /** Sum of provider-reported input tokens across every request made, including discarded re-chunk passes. */
+  /**
+   * Sum of provider-reported input tokens across every response received,
+   * including discarded re-chunk passes. A request that fails, times out, or
+   * is aborted in flight reports no usage, so it is counted only in `requests`.
+   */
   inputTokens: number;
   outputTokens: number;
-  /** Sum of provider-reported cost, or undefined if no request reported cost. */
+  /** Sum of provider-reported cost, or undefined if no response reported cost. */
   costUsd: number | undefined;
   elapsedMs: number;
   /** Estimated tokens of the full input (package tokenizer). */
   inputTokensEstimated: number;
+  /** Every request sent, including failed, retried, and aborted ones. */
   requests: number;
   retries: number;
   rechunks: number;

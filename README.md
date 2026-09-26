@@ -25,11 +25,10 @@ The package is not on the npm registry yet. To use it, build it from source:
 ```bash
 git clone https://github.com/taylorbayouth/jev-infinite-ctx.git
 cd jev-infinite-ctx
-npm install
-npm run build          # emits dist/
+npm install            # also builds dist/ (the "prepare" script runs `npm run build`)
 ```
 
-Then install it into your project from the checkout, or from a tarball you make with `npm pack`:
+Then install it into your project from the checkout, or from a tarball you make with `npm pack` (which also builds first):
 
 ```bash
 npm install ../jev-infinite-ctx
@@ -71,7 +70,7 @@ const result = await decide({
 console.log(result.choice);                  // "tree"
 console.log(result.probabilities);           // { tree: 0.7714, rock: 0.1686, other: 0.06 }
 console.log(result.confidence.base);         // 0.8066, weighted mean of Jev's chunk confidences
-console.log(result.confidence.adjusted);     // 0.8576, after C3
+console.log(result.confidence.adjusted);     // 0.8448, after C3
 console.log(result.confidence.agreement);    // 0.949, cross-chunk agreement
 console.log(`${result.chunks.count} chunks, ${result.usage.requests} requests, $${result.usage.costUsd ?? "n/a"}`);
 ```
@@ -150,7 +149,7 @@ The library checks every question before it makes any request. A violation throw
 | `score` | Array of 2 to 10 levels, lowest first. |
 | `noul` | Optional `{ true, false }`. When present, both keys are required. |
 
-`instructions` and every criterion must be a non-empty string or a JSON object or array. The question must be JSON-serializable. Unknown fields anywhere in the request are rejected, so a mistyped option name never silently falls back to its default. The library does not invent an `other` option for `choice`. If the options might not cover every case, include an `other` or `none` option yourself.
+`instructions` and every criterion must be a non-empty string, or a JSON object or array. The question must be JSON-serializable. Unknown fields anywhere in the request are rejected, so a mistyped option name never silently falls back to its default. The library does not invent an `other` option for `choice`. If the options might not cover every case, include an `other` or `none` option yourself.
 
 ## How it works
 
@@ -238,7 +237,7 @@ If the reduced vector sums to 0 (for example, `min` over chunks that put all the
 The final answer for more than one chunk:
 
 ```text
-choice          = argmax_j P_agg[j]        (ties go to the earliest label)
+choice          = argmax_j P_agg[j]        (ties within 1e-12 go to the earliest label)
 score           = Σ_j j * P_agg[j]
 normalizedScore = score / (levels - 1)     (metadata only; score keeps Jev's scale)
 legend          = { "0": criteria[0], "1": criteria[1], ... }
@@ -275,7 +274,7 @@ noul:           C_base = |2 * noul - 1|                             source "deri
 **Correction**
 
 ```text
-N_eff      = 1 + Σ_{i>=2} uniqueTokens_i / tokens_i
+N_eff      = clamp(Σ_i uniqueTokens_i / max_i tokens_i, 1, N)
 S          = 1 - exp(-λ * (N_eff - 1))
 G          = clamp((A - A_floor) / (1 - A_floor), 0, 1) ^ γ
 adjustment = max(0, cap - C_base) * S * G
@@ -296,21 +295,21 @@ The defaults are `λ = 0.25`, `A_floor = 0.5`, `γ = 2`, and `cap = 0.98`. With 
 
 - **`max(0, cap - C_base)`**. The spec writes `(cap - C_base) * S * G`, which turns negative when Jev reports a confidence above the cap and would pull Jev's own number down. C3 only adds. If `C_base >= cap`, the adjustment is 0. As a result, `C_adjusted >= C_base` always. When `C_base < cap`, `C_adjusted <= cap`. The adjusted value is above the cap only when Jev's base already was, and in that case it is unchanged.
 - **One chunk means no adjustment.** `S = 0` at `N_eff = 1`, and a single-chunk result is also short-circuited, so the adjustment is exactly 0.
-- **`N_eff` comes from real unique-token counts**, not the approximation `1 + (N - 1)(1 - r)`. A short final chunk adds less than a full one.
+- **`N_eff` comes from real unique-token counts**, not the approximation `1 + (N - 1)(1 - r)`. It is the new content of all chunks, measured in units of the largest chunk, so each chunk counts in proportion to the new content it carries. For equal chunks it equals the approximation. A short final chunk adds only its share of a full chunk: without overlap, a 10-token tail after a 1,000-token chunk adds 0.01.
 - **Noul certainty is derived and labelled that way.** Jev has no confidence field for noul. `|2 * noul - 1|` measures how far the aggregate is from 0.5 and carries `source: "derived"`. It is not independent evidence.
 - **A missing chunk confidence switches to a derived base.** If some choice or score chunks omit `confidence`, averaging only the chunks that reported it would over-weight them. Instead the base comes from the entropy of the aggregate, marked `"derived"`.
 - **`confidence.method: "none"`** reports `adjusted = base`, `adjustment = 0`, and `method: "none"`. The components are still computed and reported.
 
-**Worked example** (the three-chunk choice above): `N_eff = 2.818`, `A = 0.949`, `C_base = 0.8066`.
+**Worked example** (the three-chunk choice above): `N_eff = (28384 + 26838 + 9365) / 28384 = 2.275`, `A = 0.949`, `C_base = 0.8066`.
 
 ```text
-S          = 1 - exp(-0.25 * 1.818)          = 0.3652
+S          = 1 - exp(-0.25 * 1.275)          = 0.2730
 G          = ((0.949 - 0.5) / 0.5) ^ 2       = 0.8063
-adjustment = (0.98 - 0.8066) * 0.3652 * 0.8063 = 0.0511
-C_adjusted = 0.8066 + 0.0511                 = 0.8576
+adjustment = (0.98 - 0.8066) * 0.2730 * 0.8063 = 0.0382
+C_adjusted = 0.8066 + 0.0382                 = 0.8448
 ```
 
-With the same chunks at `A = 0.6`, `G` drops to 0.04 and the adjustment to 0.0025. At `A <= 0.5` the adjustment is 0.
+With the same chunks at `A = 0.6`, `G` drops to 0.04 and the adjustment to 0.0019. At `A <= 0.5` the adjustment is 0.
 
 ## Result shape
 
@@ -326,14 +325,14 @@ With the same chunks at `A = 0.6`, `G` drops to 0.04 and the adjustment to 0.002
 
   confidence: {
     base: 0.8066,                                  // C_base: weighted mean of Jev's chunk confidences
-    adjusted: 0.8576,                              // C_adjusted after C3; >= base
-    adjustment: 0.0511,                            // adjusted - base
+    adjusted: 0.8448,                              // C_adjusted after C3; >= base
+    adjustment: 0.0382,                            // adjusted - base
     source: "jev",                                 // "jev" | "derived"
     agreement: 0.949,                              // A = 1 - Σ w_i * TV_i
     method: "c3-v1",                               // "c3-v1" | "none"
     components: {
-      effectiveChunkCount: 2.818,                  // N_eff
-      saturation: 0.3652,                          // S
+      effectiveChunkCount: 2.275,                  // N_eff
+      saturation: 0.2730,                          // S
       gate: 0.8063,                                // G
       cap: 0.98, lambda: 0.25, agreementFloor: 0.5, agreementExponent: 2,
     },
@@ -343,7 +342,7 @@ With the same chunks at `A = 0.6`, `G` drops to 0.04 and the adjustment to 0.002
 
   chunks: {
     count: 3,
-    effectiveCount: 2.818,
+    effectiveCount: 2.275,
     overlap: 0.05,                                 // ratio
     overlapTokens: 1421,                           // floor(stateTokenBudget * overlap)
     stateTokenBudget: 28436,                       // budget of the final (successful) pass
@@ -375,7 +374,7 @@ With the same chunks at `A = 0.6`, `G` drops to 0.04 and the adjustment to 0.002
   },
 
   usage: {
-    inputTokens: 50143,          // provider-reported, summed over every request, including discarded re-chunk passes
+    inputTokens: 50143,          // provider-reported, summed over every response received, including discarded re-chunk passes
     outputTokens: 105,
     costUsd: 0.00184,            // undefined when no response reported cost
     elapsedMs: 1240,             // wall clock for the whole call
@@ -462,13 +461,13 @@ Defaults are exported as `DEFAULTS` (from `src/defaults.ts`). An option you leav
 | `chunking.contextSafetyReserve` | `0.08` | `[0, 0.5]` | Fraction of the remaining window held back. |
 | `chunking.protocolReserve` | `1024` | integer >= 0 | Tokens reserved for Jev's request scaffolding. |
 | `chunking.preferNaturalBoundaries` | `true` | boolean | `false` means hard token cuts only. |
-| `chunking.maxChunks` | `undefined` | integer >= 1 | Guard: throws `JevValidationError` before any request if the plan needs more chunks. |
+| `chunking.maxChunks` | `undefined` | integer >= 1 | Guard on the number of chunks. A first plan that exceeds it throws `JevValidationError` before any request. A re-chunk pass that would exceed it throws `JevContextBudgetError`, and the requests of earlier passes have already been made and billed. |
 | `execution.maxConcurrency` | `4` | integer >= 1 | Maximum number of requests in flight at once. |
 | `execution.retries` | `3` | integer >= 0 | Retries per chunk for retryable failures. |
 | `execution.retryBaseDelayMs` | `500` | >= 0 | Backoff base. |
 | `execution.retryMaxDelayMs` | `8000` | >= 0 | Maximum computed backoff. |
 | `execution.maxRechunks` | `4` | integer >= 0 | Shrink-and-rechunk passes after context-limit errors. |
-| `execution.rechunkShrinkFactor` | `0.75` | `(0, 1)` | Budget multiplier for each re-chunk. |
+| `execution.rechunkShrinkFactor` | `0.75` | `(0, 1)` | Budget multiplier for each re-chunk, applied to `min(budget, failing chunk tokens)`. |
 | `confidence.method` | `"c3"` | `"c3"`, `"none"` | `"none"` reports `adjusted = base`. |
 | `confidence.cap` | `0.98` | `(0, 1]` | `C_cap` |
 | `confidence.lambda` | `0.25` | > 0 | `λ`, saturation rate |
@@ -535,7 +534,7 @@ How the context window is resolved: an explicit `contextWindow` is used first. N
 | Response | `JevProviderError.kind` | Retried |
 | --- | --- | --- |
 | 429 | `rate_limit` | yes |
-| 503, 529, or a body mentioning "overload" | `overloaded` | yes |
+| 503, 529, or a body mentioning "overload" (outside any echo of the state) | `overloaded` | yes |
 | other 5xx | `server` | yes |
 | 408, request timeout | `timeout` | yes |
 | `fetch` rejected | `network` | yes |
@@ -545,7 +544,9 @@ How the context window is resolved: an explicit `contextWindow` is used first. N
 | malformed body | `invalid_response` | no |
 | anything else | `unknown` | no |
 
-A `Retry-After` header (in seconds or as an HTTP date) is used as the delay. A 200 response with a top-level `error` object is classified by its `code` in the same way. Error messages and `body` (truncated to 2,000 characters) never contain the request state. Any echo of it is redacted.
+A `Retry-After` header (in seconds or as an HTTP date) is used as the delay. A 200 response with a top-level `error` object is classified by its `code` in the same way. Wording inside an echo of the state (a shared run of 32 or more characters, or the whole state) is ignored when choosing the kind, so the document's own text cannot make an error look like a context-limit error or an overload.
+
+Error messages never quote the provider's error text, so they never contain the request state. That text is kept on `body` (truncated to 2,000 characters). In `body`, every run of 8 or more characters shared with the state is replaced by `[redacted]`, including runs hidden by JSON escaping (quoted, nested in a JSON string, or `\u`-escaped in either case). This redaction is best-effort: a shorter fragment is not detected.
 
 ### Writing a custom JevTransport
 
@@ -668,7 +669,7 @@ interface Tokenizer {
 }
 ```
 
-**The default is conservative.** Jev's tokenizer is not public, so exact counts are impossible. `defaultTokenizer`, a `HeuristicTokenizer` named `"heuristic-v1"`, makes one O(n) pass. It follows how BPE tokenizers pre-split text (letter runs, camelCase humps, digit groups of three, whitespace, punctuation, CJK, emoji) and charges each run a fixed cost. The costs are calibrated against `cl100k_base` and `o200k_base` so that estimates err high. On English prose it counts about 1.35 times what those tokenizers report (about 3.1 to 3.5 characters per token). On JSON it counts about 1.1 times. Code, logs, HTML, Markdown, CJK, and emoji also estimate at or above both. The two failure modes have different costs. Overestimating means slightly smaller chunks and a few more requests. Underestimating means chunks that exceed Jev's real window, and each of those causes a context-limit error and a complete re-chunk pass. Known low estimates: accented Latin and some other scripts can fall below `cl100k_base`, and random base64 or hex can run up to about 30% below both. The safety reserve and the shrink-and-rechunk loop absorb these misses.
+**The default is conservative.** Jev's tokenizer is not public, so exact counts are impossible. `defaultTokenizer`, a `HeuristicTokenizer` named `"heuristic-v1"`, makes one O(n) pass. It follows how BPE tokenizers pre-split text (letter runs, camelCase humps, digit groups of three, whitespace, punctuation, CJK, emoji) and charges each run a fixed cost. The costs are calibrated against `cl100k_base` and `o200k_base` so that estimates err high. On English prose it counts about 1.25 to 1.35 times what those tokenizers report (about 3.4 to 4 characters per estimated token on plain prose, about 3 on Markdown-heavy text). On JSON it counts about 1.1 to 1.35 times. Code, logs, CSV, numeric tables, HTML, Markdown, CJK (NFC), and emoji also estimate at or above both. The two failure modes have different costs. Overestimating means slightly smaller chunks and a few more requests. Underestimating means chunks that exceed Jev's real window, and each of those causes a context-limit error and a complete re-chunk pass. Known low estimates: accented Latin and some other scripts can fall below `cl100k_base`. Text dense in combining marks (pointed Hebrew, Arabic with harakat, decomposed Vietnamese) can also fall below `o200k_base`, by about 10 to 30%, and zalgo text by about 55%. Decomposed (NFD) Hangul runs about 35% below both, and halfwidth Katakana up to about 10%. Lines of numbers indented by two or three spaces run up to about 20% below both. Random strings run below both: letter runs such as DNA or protein sequences by about 55 to 60%, random Unicode code points by about 45 to 50%, base64 by about 30%, random printable ASCII by about 10%, and hex by about 5%. The safety reserve and the shrink-and-rechunk loop absorb these misses.
 
 **Plugging in js-tiktoken.** `createTokenizer` wraps any counting function. Each result is validated: a non-finite or negative count throws `JevValidationError`, and fractional counts are rounded up.
 
@@ -699,7 +700,7 @@ Every error extends `JevInfiniteCTXError`.
 
 | Error | When | Fields |
 | --- | --- | --- |
-| `JevValidationError` | Invalid request or options, empty input, a question too large for the window, a missing API key, or a first plan that exceeds `chunking.maxChunks`. Thrown before any request. Also thrown when a tokenizer returns an invalid count. | |
+| `JevValidationError` | Invalid request or options, empty input, a question too large for the window, a missing API key, or a first plan that exceeds `chunking.maxChunks`. Thrown before any request. Also thrown when a tokenizer returns an invalid count or throws (its error is the `cause`); on a re-chunk pass this can happen after requests were made. | |
 | `JevProviderError` | Thrown by transports. You see it as the `cause` of the errors below. | `kind`, `status`, `retryAfterMs`, `retryable`, `body` |
 | `JevResponseError` | Jev's answer does not match the question: wrong type, unknown label, invalid probabilities, or no `decision` answer. | |
 | `JevChunkFailedError` | A chunk failed permanently: a non-retryable error, or retries used up. | `chunkIndex`, `attempts`, `cause` |
@@ -711,7 +712,7 @@ How each kind of failure is handled:
 - **Transient failures** (`rate_limit`, `server`, `overloaded`, `timeout`, `network`) are retried up to `execution.retries` times per chunk. The delay is `min(retryMaxDelayMs, retryBaseDelayMs * 2^(attempt - 1)) * (0.5 + 0.5 * random())`. A server `Retry-After` value overrides it, capped at `max(retryMaxDelayMs, 60 s)`.
 - **Context limit** from any chunk: the current pass is cancelled and the new budget is `floor(min(budget, failingChunkTokens) * rechunkShrinkFactor)`. The entire input is then re-planned and every chunk runs again. With the defaults, a 28,436-token budget shrinks to about 21,300, then about 16,000, and so on. Using the failing chunk's size keeps a short input from resending the same oversized request. The overflow is never dropped.
 - **Any other failure** cancels the requests in flight (through their `signal`) and rejects with a single error: the first failure, never a partial aggregate. A permanent chunk failure, including a `JevResponseError`, arrives as `JevChunkFailedError`, with the original error as `cause`.
-- **Usage from discarded passes** is still counted in `usage.inputTokens`, `usage.requests`, and so on, so the cost stays accurate.
+- **Usage from discarded passes** is still counted. `usage.requests` counts every request sent. `usage.inputTokens`, `usage.outputTokens`, and `usage.costUsd` sum the usage reported in every response received, including responses from discarded re-chunk passes. A request that fails, times out, or is aborted in flight (siblings cancelled when a pass is discarded or fails) returns no usage. It counts in `usage.requests` but not in tokens or cost, so the provider may bill slightly more than `usage.costUsd` reports.
 
 ```ts
 import { readFile } from "node:fs/promises";

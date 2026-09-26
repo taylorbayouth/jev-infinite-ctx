@@ -16,10 +16,10 @@
 
 import { aggregate } from "./aggregation.js";
 import { computeAgreement } from "./agreement.js";
-import { applyC3, baseConfidence, effectiveChunkCount } from "./c3.js";
+import { applyC3, baseConfidence } from "./c3.js";
 import { computeStateBudget, planChunks } from "./chunking.js";
 import { mapWithConcurrency } from "./concurrency.js";
-import { MIN_STATE_TOKENS, NOUL_LABELS, QUESTION_KEY } from "./defaults.js";
+import { ARGMAX_TIE_TOLERANCE, MIN_STATE_TOKENS, NOUL_LABELS, QUESTION_KEY } from "./defaults.js";
 import {
   JevAbortError,
   JevChunkFailedError,
@@ -33,8 +33,9 @@ import { clamp01, distributionToRecord, extractConfidence, toDistribution } from
 import { withRetry } from "./retry.js";
 import { defaultTokenizer } from "./tokenizer.js";
 import { DirectJevTransport } from "./transports/direct.js";
+import { isRecord } from "./transports/http.js";
 import { OpenRouterJevTransport } from "./transports/openrouter.js";
-import { resolveOptions, validateRequest } from "./validation.js";
+import { validateRequestAndResolve } from "./validation.js";
 import type {
   ChunkPlan,
   ChunkResult,
@@ -106,8 +107,8 @@ export async function decide<Q extends JevQuestion>(
   request: JevInfiniteCTXRequest<Q>,
 ): Promise<ResultFor<Q>> {
   const startedAt = performance.now();
-  const req = validateRequest(request);
-  const options = resolveOptions(req);
+  // Validates and resolves in one pass, so each option section is read once.
+  const { request: req, options } = validateRequestAndResolve(request);
   const emit = createEmitter(req.onEvent);
   const tally: Tally = {
     requests: 0,
@@ -524,7 +525,8 @@ function buildResult(
     chunkConfidences: outcomes.map((outcome) => outcome.confidence),
     weights,
   });
-  const effectiveCount = effectiveChunkCount(plan.chunks);
+  // planChunks already computed N_eff with c3.effectiveChunkCount (spec 11.3).
+  const effectiveCount = plan.effectiveCount;
   const c3 = applyC3({
     base: base.base,
     agreement: agreement.agreement,
@@ -631,12 +633,15 @@ function outcomeAt(outcomes: readonly ChunkOutcome[], index: number): ChunkOutco
   return outcome;
 }
 
-/** The most probable label; ties go to the earliest label in criteria order. */
+/**
+ * The most probable label. Labels within ARGMAX_TIE_TOLERANCE of the maximum
+ * tie, and ties go to the earliest label in criteria order: the aggregate's
+ * float sums depend on chunk order, so an exact tie must not be decided by
+ * rounding noise.
+ */
 function argmaxLabel(distribution: Distribution): string {
-  let best = 0;
-  distribution.probs.forEach((p, j) => {
-    if (p > (distribution.probs[best] ?? -Infinity)) best = j;
-  });
+  const max = distribution.probs.reduce((m, p) => Math.max(m, p), -Infinity);
+  const best = distribution.probs.findIndex((p) => p >= max - ARGMAX_TIE_TOLERANCE);
   const label = distribution.labels[best];
   if (label === undefined) throw new JevInfiniteCTXError("Internal error: empty distribution.");
   return label;
@@ -750,10 +755,6 @@ function withStatus(status: number | undefined): { status?: number } {
 
 function elapsedSince(startedAt: number): number {
   return Math.round(performance.now() - startedAt);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function abortError(signal: AbortSignal): JevAbortError {

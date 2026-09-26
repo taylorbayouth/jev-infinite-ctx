@@ -24,7 +24,7 @@ const LOWER = 2;
 const LATIN_EXT = 3;
 /** Combining mark; extends the letter run it follows. */
 const MARK = 4;
-/** Han, Hiragana, Katakana, Hangul letter. */
+/** Han, Hiragana, Katakana, Hangul syllable. */
 const CJK = 5;
 /** Letter of any other script (Cyrillic, Greek, Arabic, Devanagari, Thai, ...). */
 const OTHER_LETTER = 6;
@@ -35,18 +35,32 @@ const SPACE = 8;
 const PUNCT = 9;
 /** Non-ASCII symbol that modern vocabularies usually hold as a single token. */
 const SYMBOL = 10;
-/** Non-ASCII symbol that often costs two tokens. */
-const RARE_SYMBOL = 11;
+/**
+ * Non-ASCII character that often costs two tokens: rarer symbols, and letters
+ * that vocabularies seldom merge (halfwidth Katakana, Hangul Jamo).
+ */
+const RARE = 11;
 const HIGH_SURROGATE = 12;
 const LOW_SURROGATE = 13;
 
 // ---------------------------------------------------------------------------
-// Costs, calibrated against cl100k_base and o200k_base. English prose (~1.35x,
-// 3.1-3.5 chars/token), code, JSON, CSV, logs, HTML, Markdown, CJK and emoji
-// all estimate at or above both. Accented Latin and other scripts estimate at
-// or above o200k but can fall below cl100k, whose vocabulary is English-heavy;
-// random base64 or hex strings run up to ~30% below both. The orchestrator's
-// safety reserve and shrink-and-rechunk loop absorb such misses (spec 6.1, 7).
+// Costs, calibrated against cl100k_base and o200k_base. English prose (~1.25-
+// 1.35x: about 3.4-4 chars per estimated token, ~3 on Markdown-heavy text),
+// code, JSON, CSV, logs, numeric tables, HTML, Markdown, NFC CJK and emoji
+// all estimate at or above both. Known low estimates:
+// - lines of numbers indented by two or three spaces ("\n  42") run up to
+//   ~20% below both: BPE splits that run into three tokens;
+// - accented Latin and other scripts can fall below cl100k, whose vocabulary
+//   is English-heavy;
+// - text dense in combining marks (pointed Hebrew, Arabic with harakat, NFD
+//   Vietnamese, zalgo) can fall below o200k too, by ~10-55%;
+// - decomposed (NFD) Hangul runs ~35% below both, halfwidth Katakana up to
+//   ~10%;
+// - random strings run below both: letter runs (DNA or protein sequences,
+//   random identifiers) by ~55-60%, base64 by ~30%, printable ASCII by ~10%,
+//   hex by ~5%, and uniformly random BMP code points by ~45-50%.
+// The orchestrator's safety reserve and shrink-and-rechunk loop absorb such
+// misses (spec 6.1, 7).
 // ---------------------------------------------------------------------------
 
 /** Letter units per token in a Latin run. Common English words are one token up to ~5 letters. */
@@ -57,7 +71,7 @@ const LATIN_UNITS_PER_TOKEN = 5;
  */
 const NON_ASCII_LATIN_UNITS = 5;
 /**
- * Tokens per Han, Kana or Hangul letter. cl100k spends ~1.1-1.15 per letter
+ * Tokens per Han, Kana or Hangul syllable. cl100k spends ~1.1-1.15 per letter
  * on everyday prose (o200k ~0.7). Accumulated across the whole text and
  * rounded up once, so short runs are not over-charged.
  */
@@ -100,6 +114,18 @@ function classifyNonAscii(code: number): number {
   if (WHITESPACE_RE.test(ch)) return SPACE;
   if (MARK_RE.test(ch)) return MARK;
   if (LETTER_RE.test(ch)) {
+    // Conjoining and compatibility Jamo, halfwidth Katakana and Hangul: the
+    // real tokenizers spend about 2-3 tokens on each, far more than on a
+    // composed syllable or fullwidth Kana.
+    if (
+      (code >= 0x1100 && code <= 0x11ff) ||
+      (code >= 0x3130 && code <= 0x318f) ||
+      (code >= 0xa960 && code <= 0xa97f) ||
+      (code >= 0xd7b0 && code <= 0xd7ff) ||
+      (code >= 0xff61 && code <= 0xffdc)
+    ) {
+      return RARE;
+    }
     if (CJK_RE.test(ch)) return CJK;
     return LATIN_RE.test(ch) ? LATIN_EXT : OTHER_LETTER;
   }
@@ -115,7 +141,7 @@ function classifyNonAscii(code: number): number {
   ) {
     return SYMBOL;
   }
-  return RARE_SYMBOL;
+  return RARE;
 }
 
 function classOf(code: number): number {
@@ -138,11 +164,13 @@ function classOf(code: number): number {
  *   o200k does for camelCase) and each hump costs ceil(units / 5), where an
  *   ASCII letter is 1 unit and a non-ASCII Latin letter or combining mark is 5;
  * - Han, Hiragana, Katakana and Hangul letters cost 1.25 each, summed over
- *   the whole text and rounded up once;
- * - other-script letter runs cost ceil(length / 2);
+ *   the whole text and rounded up once; Jamo and halfwidth forms cost 2;
+ * - other-script letter runs cost ceil(letters / 2) plus 1 per combining mark;
  * - ASCII digit runs cost ceil(length / 3);
  * - a lone U+0020 is free (it merges into the next word); any other
  *   whitespace run costs ceil(length / 4), so "\n\n" is 1;
+ * - a whitespace run that ends in U+0020 right before an ASCII digit costs 1
+ *   more, because BPE keeps that space out of the digit group;
  * - ASCII punctuation runs cost ceil(length / 2);
  * - other symbols cost 1 or 2, astral code points (emoji) 3, lone surrogates 1.
  *
@@ -192,11 +220,15 @@ export class HeuristicTokenizer implements Tokenizer {
           break;
         }
         case OTHER_LETTER: {
+          // A mark costs 1, as it does when stray, so that adding a letter
+          // before marks never lowers the count (monotonicity).
+          let marks = 0;
           for (; j < length; j++) {
             const next = classOf(text.charCodeAt(j));
-            if (next !== OTHER_LETTER && next !== MARK) break;
+            if (next === MARK) marks++;
+            else if (next !== OTHER_LETTER) break;
           }
-          tokens += Math.ceil((j - i) / OTHER_LETTERS_PER_TOKEN);
+          tokens += Math.ceil((j - i - marks) / OTHER_LETTERS_PER_TOKEN) + marks;
           break;
         }
         case DIGIT: {
@@ -207,6 +239,12 @@ export class HeuristicTokenizer implements Tokenizer {
         case SPACE: {
           while (j < length && classOf(text.charCodeAt(j)) === SPACE) j++;
           if (j - i > 1 || code !== 0x20) tokens += Math.ceil((j - i) / SPACES_PER_TOKEN);
+          // cl100k and o200k never merge a space into the digit group after
+          // it: " 1 2" is [" ", "1", " ", "2"]. A run ending in "\n" or "\t"
+          // needs no extra token; that character already costs one.
+          if (j < length && text.charCodeAt(j - 1) === 0x20 && classOf(text.charCodeAt(j)) === DIGIT) {
+            tokens += 1;
+          }
           break;
         }
         case PUNCT: {
@@ -220,7 +258,7 @@ export class HeuristicTokenizer implements Tokenizer {
         case SYMBOL:
           tokens += 1;
           break;
-        case RARE_SYMBOL:
+        case RARE:
           tokens += 2;
           break;
         case HIGH_SURROGATE:
