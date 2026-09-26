@@ -846,6 +846,7 @@ npm test             # vitest run (unit and fast-check property tests)
 npm run test:watch   # vitest in watch mode
 npm run build        # compile src/ to dist/ (tsconfig.build.json)
 npm run check        # typecheck + test + build
+npm run smoke:live   # build, then run live decisions against OpenRouter (needs OPENROUTER_API_KEY, about $0.01)
 ```
 
 Source layout:
