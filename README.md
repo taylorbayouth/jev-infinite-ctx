@@ -534,7 +534,7 @@ How the context window is resolved: an explicit `contextWindow` is used first. N
 | Response | `JevProviderError.kind` | Retried |
 | --- | --- | --- |
 | 429 | `rate_limit` | yes |
-| 503, 529, or a body mentioning "overload" (outside any echo of the state) | `overloaded` | yes |
+| 503, 529, or another 5xx whose body mentions "overload" | `overloaded` | yes |
 | other 5xx | `server` | yes |
 | 408, request timeout | `timeout` | yes |
 | `fetch` rejected | `network` | yes |
@@ -544,9 +544,9 @@ How the context window is resolved: an explicit `contextWindow` is used first. N
 | malformed body | `invalid_response` | no |
 | anything else | `unknown` | no |
 
-A `Retry-After` header (in seconds or as an HTTP date) is used as the delay. A 200 response with a top-level `error` object is classified by its `code` in the same way. Wording inside an echo of the state (a shared run of 32 or more characters, or the whole state) is ignored when choosing the kind, so the document's own text cannot make an error look like a context-limit error or an overload.
+A `Retry-After` header (in seconds or as an HTTP date) is used as the delay. A 200 response with a top-level `error` object is classified by its `code` in the same way. Without a `code`, it is classified by its wording alone: context-length wording gives `context_limit`, "overload" gives `overloaded`, and anything else gives `unknown`. The kind is chosen from the status and the first 1,000,000 characters of the body, including any part of the state the provider echoed. So an echoed document that mentions the context window can make a 400 or 422 look like a context-limit error. The re-chunk that follows is unnecessary, but the operation still fails closed (with `JevContextBudgetError` if the wording recurs in every pass). In the same way, an echoed document that mentions "overload" makes a code-less 200 `error` object `overloaded`, so it is retried up to `execution.retries` times, and makes a 5xx `overloaded` rather than `server` (both are retried). "overload" is never read for a 4xx, so an echo cannot make a client error retryable.
 
-Error messages never quote the provider's error text, so they never contain the request state. That text is kept on `body` (truncated to 2,000 characters). In `body`, every run of 8 or more characters shared with the state is replaced by `[redacted]`, including runs hidden by JSON escaping (quoted, nested in a JSON string, or `\u`-escaped in either case). This redaction is best-effort: a shorter fragment is not detected.
+When the request carries a non-empty state, error messages never quote the provider's error text, so they never contain the state. (Without a state, a message may quote up to 300 characters of it.) An `invalid_response` message quotes a response key only when the request sent it (a question key, a criteria key, or a score level) and describes any other string the provider returned by its length, and the JSON parser's error, which quotes the body, is not kept as `cause`. The provider's response body is kept on `body`, truncated to 2,000 characters. If any run of 8 characters in that truncated body, or in the 128 characters after the cut, also occurs in the state, the whole body is replaced by `"[withheld: provider error body overlaps the request state]"`. Nothing is partially redacted. Both texts are compared with each whitespace run collapsed to one space, and the body is checked as sent and with up to three levels of JSON string escapes decoded (`\uXXXX` in either case, `\n`, `\"`, and the rest), so an echo nested in a JSON string, as in OpenRouter's `metadata.raw`, is found too. A state shorter than 8 characters withholds the body when the body contains it. A shorter fragment of a longer state is not detected.
 
 ### Writing a custom JevTransport
 

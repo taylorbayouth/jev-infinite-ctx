@@ -21,7 +21,6 @@ import { computeStateBudget, planChunks } from "./chunking.js";
 import { mapWithConcurrency } from "./concurrency.js";
 import { ARGMAX_TIE_TOLERANCE, MIN_STATE_TOKENS, NOUL_LABELS, QUESTION_KEY } from "./defaults.js";
 import {
-  JevAbortError,
   JevChunkFailedError,
   JevContextBudgetError,
   JevInfiniteCTXError,
@@ -29,11 +28,11 @@ import {
   JevResponseError,
   JevValidationError,
 } from "./errors.js";
+import { abortError, isRecord, raceAbort, throwIfAborted } from "./internal.js";
 import { clamp01, distributionToRecord, extractConfidence, toDistribution } from "./probability.js";
 import { withRetry } from "./retry.js";
 import { defaultTokenizer } from "./tokenizer.js";
 import { DirectJevTransport } from "./transports/direct.js";
-import { isRecord } from "./transports/http.js";
 import { OpenRouterJevTransport } from "./transports/openrouter.js";
 import { validateRequestAndResolve } from "./validation.js";
 import type {
@@ -237,18 +236,7 @@ function lookupContextWindow(
   if (signal === undefined) return lookup;
   // A slow catalog lookup (bounded only by the transport's own timeout) must
   // not delay a caller abort.
-  return new Promise((resolve, reject) => {
-    const onAbort = (): void => reject(abortError(signal));
-    if (signal.aborted) {
-      onAbort();
-      return;
-    }
-    signal.addEventListener("abort", onAbort, { once: true });
-    void lookup.then((value) => {
-      signal.removeEventListener("abort", onAbort);
-      resolve(value);
-    });
-  });
+  return raceAbort(lookup, signal, () => abortError(signal));
 }
 
 /**
@@ -755,12 +743,4 @@ function withStatus(status: number | undefined): { status?: number } {
 
 function elapsedSince(startedAt: number): number {
   return Math.round(performance.now() - startedAt);
-}
-
-function abortError(signal: AbortSignal): JevAbortError {
-  return new JevAbortError("The operation was aborted.", { cause: signal.reason });
-}
-
-function throwIfAborted(signal: AbortSignal | undefined): void {
-  if (signal?.aborted) throw abortError(signal);
 }

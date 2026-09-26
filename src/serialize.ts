@@ -7,6 +7,7 @@
  */
 
 import { JevInfiniteCTXError } from "./errors.js";
+import { isRecord } from "./internal.js";
 import type { ChunkResult, JevInfiniteCTXResult, JsonObject } from "./types.js";
 
 export interface SerializeOptions {
@@ -63,14 +64,10 @@ function toJsonObject(value: object): JsonObject {
     // Only possible for a hand-built result (cycle, BigInt, throwing toJSON).
     throw new JevInfiniteCTXError("Result is not JSON-serializable.", { cause: error });
   }
-  if (!isJsonObject(parsed)) {
+  if (!isRecord(parsed)) {
     // Only reachable when a top-level toJSON replaces the result with a non-object.
     throw new JevInfiniteCTXError("Result did not serialize to a JSON object.");
   }
-  return parsed;
-}
-
-/** JSON.parse output is JSON by construction; only the top-level shape needs checking. */
-function isJsonObject(value: unknown): value is JsonObject {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  // JSON.parse output is JSON by construction; only the top-level shape needed checking.
+  return parsed as JsonObject;
 }

@@ -167,8 +167,11 @@ function wireBody(state: string = STATE): JsonObject {
   return { model: "typesafe/jev-1.13", state, questions: { decision: { type: "noul", instructions: "Is it?" } } };
 }
 
-/** Shortest run shared with the state that redaction guarantees to remove from `body` (MIN_ECHO_RUN). */
+/** Shortest run shared with the state that withholds `body` (ECHO_RUN in http.ts). */
 const GUARANTEED_RUN = 8;
+
+/** What `body` holds in place of a provider body that echoes the request state. */
+const WITHHELD = "[withheld: provider error body overlaps the request state]";
 
 /** True when `text` still contains a run of `minRun` characters that also occurs in `secret`. */
 function sharesRun(text: string, secret: string, minRun = GUARANTEED_RUN): boolean {
@@ -436,41 +439,23 @@ describe("classifyHttpError", () => {
     expect(beforeEllipsis >= 0xd800 && beforeEllipsis <= 0xdbff).toBe(false);
   });
 
-  it("redacts every echo of the state passed as `redact`", () => {
+  it("withholds a body that echoes the state passed as `state`", () => {
     const body = JSON.stringify({ error: { message: `Invalid state: ${STATE}`, metadata: { raw: STATE } } });
     const error = classifyHttpError(400, body, undefined, "P", STATE);
     expectNoState(error);
-    // With a state, the message never quotes provider text (F01); the kind
-    // ignores the echo's "context window" and "too many tokens" (F16).
-    expect(error.message).toBe("P request failed with HTTP 400 (bad_request)");
-    expect(error.body).toContain("[redacted]");
+    // With a state, the message never quotes provider text (F01). The kind
+    // reads the body, echo included, so the echo's "context window" counts.
+    expect(error.message).toBe("P request failed with HTTP 400 (context_limit)");
+    expect(error.body).toBe(WITHHELD);
   });
 
-  it("redacts the full extent of an echo found through a later, different occurrence in the state", () => {
-    // The probe at offset 16 ("abc…p") first occurs in the state after "Y", so
-    // its range starts at 16. The next probe matches the occurrence after "X",
-    // whose range reaches back to offset 15; merging must take the earliest start.
-    const p = "abcdefghijklmnop";
-    const q = "QRSTUVWXYZ!@#$%^";
-    const state = `Y${p}.X${p}${q}Z`;
-    const body = `0123456789-=+*&X${p}${q}`;
-    const error = classifyHttpError(500, body, undefined, "P", state);
-    expect(error.body).toBe("0123456789-=+*&[redacted]");
-    expect(error.message).toBe("P request failed with HTTP 500 (server)");
-  });
-
-  it("replaces adjacent echoes of different parts of the state with a single marker", () => {
-    const body = `${STATE.slice(0, 60)}${STATE.slice(100, 160)}`;
-    const error = classifyHttpError(500, body, undefined, "P", STATE);
-    expect(error.body).toBe("[redacted]");
-  });
-
-  it("classifies on the full body even when the echo is redacted from what is kept", () => {
+  it("classifies on the full body even when the body is withheld", () => {
     const body = JSON.stringify({
       error: { code: 400, message: "Provider returned error", metadata: { raw: `context_length_exceeded for ${STATE}` } },
     });
     const error = classifyHttpError(400, body, undefined, "P", STATE);
     expect(error.kind).toBe("context_limit");
+    expect(error.body).toBe(WITHHELD);
     expectNoState(error);
   });
 
@@ -484,9 +469,108 @@ describe("classifyHttpError", () => {
         if (status === 401 || status === 403) expect(error.kind).toBe("auth");
         if (status === 429) expect(error.kind).toBe("rate_limit");
         if (status >= 500 && status !== 503 && status !== 529) expect(["server", "overloaded"]).toContain(error.kind);
+        if (error.kind === "overloaded") expect(status).toBeGreaterThanOrEqual(500);
         if (error.kind === "context_limit") expect([400, 413, 422]).toContain(status);
         expect((error.body ?? "").length).toBeLessThanOrEqual(2000);
       }),
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Error bodies for a request with state
+// ---------------------------------------------------------------------------
+
+describe("error bodies for a request with state", () => {
+  it("withholds the whole body when an 8-character run of it occurs in the state, whitespace collapsed", () => {
+    const memo = "Board memo. The Lisbon acquisition closes on 14 March,\tpending the regulator's review.";
+    // Every 8-character run of the quote spans the tab, which the provider re-wrapped as two spaces.
+    const body = JSON.stringify({ error: { message: "Invalid input near 'March,  pending' in state" } });
+    const error = classifyHttpError(400, body, undefined, "P", memo);
+    expect(error.body).toBe(WITHHELD);
+    expect(error.message).toBe("P request failed with HTTP 400 (bad_request)");
+  });
+
+  it("keeps a body that shares no 8-character run with the state verbatim, truncated to 2000 characters", () => {
+    // The echo starts 1,000 characters past the cut, beyond the 128 that are also compared.
+    const long = classifyHttpError(500, `${"x".repeat(3000)}${STATE}`, undefined, "P", STATE);
+    expect(long.body).toBe(`${"x".repeat(1999)}…`);
+    expect(long.message).toBe("P request failed with HTTP 500 (server)");
+
+    const short = JSON.stringify({ error: { code: 400, message: "questions.decision.criteria must have 2 options" } });
+    expect(classifyHttpError(400, short, undefined, "P", STATE).body).toBe(short);
+  });
+
+  it("withholds a \\u-escaped CJK echo, decoding an escaped surrogate pair unit by unit", () => {
+    const state = "診療記録：𠮷田花子さん、東京都港区在住。二型糖尿病の経過観察中。";
+    // Python's json.dumps default: every non-ASCII UTF-16 unit as \uXXXX.
+    const asciiJson = (value: unknown): string =>
+      JSON.stringify(value).replace(/[\u0080-￿]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+
+    const body = asciiJson({ detail: `unexpected text: ${state.slice(10, 22)}` });
+    expect(body).toMatch(/^[\x20-\x7e]*$/);
+    expect(classifyHttpError(422, body, undefined, "P", state).body).toBe(WITHHELD);
+
+    // Exactly 8 UTF-16 units, two of them the escaped surrogate pair of U+20BB7.
+    const pair = asciiJson({ detail: "unknown name 𠮷田花子さん、" });
+    expect(pair).toContain("\\ud842\\udfb7");
+    expect(classifyHttpError(422, pair, undefined, "P", state).body).toBe(WITHHELD);
+  });
+
+  it("withholds a body that contains a state shorter than 8 characters", () => {
+    const body = JSON.stringify({ error: { message: "unknown patient Zoë" } });
+    expect(classifyHttpError(400, body, undefined, "P", "Zoë").body).toBe(WITHHELD);
+    expect(classifyHttpError(400, '{"error":"unknown patient Zo\\u00EB"}', undefined, "P", "Zoë").body).toBe(WITHHELD);
+
+    const other = JSON.stringify({ error: { message: "unknown patient Ana" } });
+    expect(classifyHttpError(400, other, undefined, "P", "Zoë").body).toBe(other);
+  });
+
+  it("compares a non-string state as its JSON text", async () => {
+    const fetchMock = fetchAlways(() => jsonResponse({ detail: "Unknown entity 'Maria Garcia'" }, { status: 422 }));
+    const body: JsonObject = { ...wireBody(), state: { patient: "Maria Garcia", reason: "chest pain" } };
+    const error = await providerErrorOf(postDecision(httpConfig(fetchMock), body));
+    expect(error.body).toBe(WITHHELD);
+    expect(error.message).toBe("TestProvider request failed with HTTP 422 (bad_request)");
+  });
+
+  it("classifies and checks a 1 MB body against a 200K-character state in under 100 ms", () => {
+    const state = Array.from({ length: 5000 }, (_, i) => `Clause ${i}: the tenant pays the rent on the first of the month.`)
+      .join("\n")
+      .slice(0, 200_000);
+    const raw = "upstream failure; ".repeat(60_000);
+    const body = JSON.stringify({ error: { code: 400, message: "Provider returned error", metadata: { raw } } });
+    expect(body.length).toBeGreaterThan(1_000_000);
+
+    // No overlap, so the whole state is scanned: the slowest case. The best of
+    // three runs keeps a busy machine from failing the bound.
+    let bestMs = Number.POSITIVE_INFINITY;
+    for (let run = 0; run < 3; run += 1) {
+      const started = performance.now();
+      const error = classifyHttpError(400, body, undefined, "P", state);
+      bestMs = Math.min(bestMs, performance.now() - started);
+      expect(error.kind).toBe("bad_request");
+      expect(error.body).toBe(`${body.slice(0, 1999)}…`);
+    }
+    expect(bestMs).toBeLessThan(100);
+  });
+
+  it("bounds classification cost for a 50 MB body: only the first 1,000,000 characters are scanned", () => {
+    const body = "upstream failure; ".repeat(Math.ceil(50_000_000 / 18));
+    const state = "Clause 1: the tenant pays the rent on the first of the month.".repeat(1000);
+    let bestMs = Number.POSITIVE_INFINITY;
+    for (let run = 0; run < 2; run += 1) {
+      const started = performance.now();
+      const plain = classifyHttpError(400, body, undefined, "P");
+      const withState = classifyHttpError(400, body, undefined, "P", state);
+      bestMs = Math.min(bestMs, performance.now() - started);
+      expect(plain.message).toBe(`P request failed with HTTP 400 (bad_request): ${body.slice(0, 299)}…`);
+      expect(withState.body).toBe(`${body.slice(0, 1999)}…`);
+    }
+    expect(bestMs).toBeLessThan(250);
+    // Wording past the scan window does not choose the kind.
+    expect(classifyHttpError(400, `${"x".repeat(1_000_000)} maximum context length`, undefined, "P").kind).toBe(
+      "bad_request",
     );
   });
 });
@@ -653,11 +737,13 @@ describe("parseNativeResponse", () => {
 
   it("names the offending field without echoing string contents", () => {
     const secretish = "The quarterly revenue for Nightingale";
-    expect(() => parseNativeResponse({ model: "m", answers: { q: { type: "noul", noul: secretish } } }, "P")).toThrow(
-      'answers["q"].noul must be a finite number, got a string of length 37',
-    );
-    expect(() => parseNativeResponse({ model: "m", answers: { q: { type: "multi" } } }, "P")).toThrow(
-      'answers["q"].type must be "choice", "score", or "noul", got "multi"',
+    const known = new Set(["q"]);
+    expect(() =>
+      parseNativeResponse({ model: "m", answers: { q: { type: "noul", noul: secretish } } }, "P", known),
+    ).toThrow('answers["q"].noul must be a finite number, got a string of length 37');
+    // A type string that is not a protocol token came from the provider, so only its length is shown.
+    expect(() => parseNativeResponse({ model: "m", answers: { q: { type: "multi" } } }, "P", known)).toThrow(
+      'answers["q"].type must be "choice", "score", or "noul", got a string of length 5',
     );
   });
 });
@@ -771,12 +857,17 @@ describe("postDecision", () => {
     expect(error.retryable).toBe(false);
   });
 
-  it("keeps the redacted body of a non-JSON 2xx", async () => {
+  it("keeps the body of a non-JSON 2xx, or withholds it when it echoes the state", async () => {
+    const page = "<html>Gateway page. Try again later.</html>";
+    const plain = await providerErrorOf(postDecision(httpConfig(fetchAlways(() => textResponse(page))), wireBody()));
+    expect(plain.kind).toBe("invalid_response");
+    expect(plain.status).toBe(200);
+    expect(plain.body).toBe(page);
+
     const fetchMock = fetchAlways(() => textResponse(`Gateway page. You sent: ${STATE}`));
     const error = await providerErrorOf(postDecision(httpConfig(fetchMock), wireBody()));
     expect(error.kind).toBe("invalid_response");
-    expect(error.status).toBe(200);
-    expect(error.body).toContain("Gateway page.");
+    expect(error.body).toBe(WITHHELD);
     expectNoState(error);
   });
 
@@ -891,22 +982,22 @@ describe("postDecision", () => {
     it.each(echoes)("%s", async (_label, factory) => {
       const error = await providerErrorOf(postDecision(httpConfig(fetchAlways(factory)), wireBody()));
       expectNoState(error);
-      expect(`${error.message}${error.body ?? ""}`).toContain("[redacted]");
+      expect(error.body).toBe(WITHHELD);
     });
 
-    it("redacts a very large echoed state and still bounds the body", async () => {
+    it("withholds the body for a very large echoed state", async () => {
       const bigState = Array.from({ length: 1500 }, (_, i) => `Sentence ${i} of the confidential record.`).join(" ");
       const fetchMock = fetchAlways(() => jsonResponse({ error: { message: `too large: ${bigState}` } }, { status: 400 }));
       const error = await providerErrorOf(postDecision(httpConfig(fetchMock), wireBody(bigState)));
       expect(error.kind).toBe("bad_request");
-      expect((error.body ?? "").length).toBeLessThanOrEqual(2000);
+      expect(error.body).toBe(WITHHELD);
       expectNoState(error, bigState);
     });
 
-    it("withholds the body when the redaction marker itself would contain the state", async () => {
+    it("withholds the body when it contains a one-character state", async () => {
       const fetchMock = fetchAlways(() => jsonResponse({ error: { message: "bad value e" } }, { status: 400 }));
       const error = await providerErrorOf(postDecision(httpConfig(fetchMock), wireBody("e")));
-      expect(error.body).toBeUndefined();
+      expect(error.body).toBe(WITHHELD);
       expect(error.message).toBe("TestProvider request failed with HTTP 400 (bad_request)");
     });
 
@@ -1449,31 +1540,6 @@ describe("DirectJevTransport", () => {
 // Regression tests for review findings
 // ---------------------------------------------------------------------------
 
-/**
- * `text` and each level of JSON unescaping of it, whitespace collapsed: an
- * oracle, written independently of http.ts, for where an echo can hide.
- */
-function unescapedViews(text: string): string[] {
-  const controls: Record<string, string> = { b: "\b", f: "\f", n: "\n", r: "\r", t: "\t" };
-  const views: string[] = [];
-  let current = text;
-  for (let level = 0; level <= 3; level += 1) {
-    views.push(current.replace(/\s+/g, " "));
-    const next = current.replace(/\\(?:u([0-9a-fA-F]{4})|(["\\/bfnrt]))/g, (_match, hex?: string, char?: string) =>
-      hex !== undefined ? String.fromCharCode(Number.parseInt(hex, 16)) : (controls[char!] ?? char!),
-    );
-    if (next === current) break;
-    current = next;
-  }
-  return views;
-}
-
-/** True when some unescaped view of `text` shares a run of `minRun` characters with `state`. */
-function leaksState(text: string, state: string, minRun = GUARANTEED_RUN): boolean {
-  const flat = state.replace(/\s+/g, " ");
-  return unescapedViews(text).some((view) => sharesRun(view, flat, minRun));
-}
-
 const NOUL: NoulQuestion = { type: "noul", instructions: "Does the record mention a diagnosis?" };
 
 describe("regression: short, nested, and re-escaped state echoes (F01)", () => {
@@ -1481,11 +1547,11 @@ describe("regression: short, nested, and re-escaped state echoes (F01)", () => {
     "Patient record. SSN 123-45-6789, diagnosed with type 2 diabetes in March. Follow-up scheduled next quarter with endocrinology.";
   const FRAGMENT_BODY = JSON.stringify({ error: { message: "Invalid input near 'SSN 123-45-6789, diagnosed' in state" } });
 
-  it("redacts a short mid-state fragment from body and never quotes it in the message", async () => {
+  it("withholds a body quoting a short mid-state fragment and never quotes it in the message", async () => {
     const fetchMock = fetchAlways(() => textResponse(FRAGMENT_BODY, { status: 400 }));
     const error = await providerErrorOf(postDecision(httpConfig(fetchMock), wireBody(PATIENT)));
     expect(error.message).toBe("TestProvider request failed with HTTP 400 (bad_request)");
-    expect(error.body).toBe(JSON.stringify({ error: { message: "Invalid input near '[redacted]' in state" } }));
+    expect(error.body).toBe(WITHHELD);
   });
 
   it("keeps the fragment out of the JevChunkFailedError that decide() throws", async () => {
@@ -1500,7 +1566,7 @@ describe("regression: short, nested, and re-escaped state echoes (F01)", () => {
     expect(message).not.toMatch(/SSN|123-45-6789|diagnosed|Invalid input/);
   });
 
-  it("redacts a multi-line state double-escaped inside OpenRouter's metadata.raw", async () => {
+  it("withholds a multi-line state echo double-escaped inside OpenRouter's metadata.raw", async () => {
     const state = [
       "Name: John Q. Doe",
       "SSN: 123-45-6789",
@@ -1522,56 +1588,114 @@ describe("regression: short, nested, and re-escaped state echoes (F01)", () => {
       new OpenRouterJevTransport({ apiKey: "sk-or-test", fetch: fetchMock }).decide(request({ state })),
     );
     expect(error.message).toBe("OpenRouter request failed with HTTP 400 (bad_request)");
-    expect(error.body).toBe(JSON.stringify(nested("bad state: [redacted]")));
+    expect(error.body).toBe(WITHHELD);
   });
 
-  it("redacts an echo with Go's \\u003c, \\u003e, and \\u0026 escapes", () => {
+  it("withholds an echo with Go's \\u003c, \\u003e, and \\u0026 escapes", () => {
     const state = "<b>Name:</b> John Q. Doe<br><b>SSN:</b> 123-45-6789<br><b>Dx:</b> HIV & hepatitis C<br>";
     const goEscaped = JSON.stringify({ error: `bad state ${state}` })
       .replace(/</g, "\\u003c")
       .replace(/>/g, "\\u003e")
       .replace(/&/g, "\\u0026");
     const error = classifyHttpError(400, goEscaped, undefined, "P", state);
-    expect(error.body).toBe('{"error":"bad state [redacted]"}');
+    expect(error.body).toBe(WITHHELD);
     expect(error.message).toBe("P request failed with HTTP 400 (bad_request)");
   });
 
-  it("redacts an echo with uppercase \\u escapes (.NET style)", () => {
+  it("withholds an echo with uppercase \\u escapes (.NET style)", () => {
     const state = "Zoë Müller, SSN 123-45-6789, née Schmidt, lives in Zürich.";
     const escaped = JSON.stringify({ error: `bad state ${state}` }).replace(
-      /[\u0080-￿]/g,
+      /[\u0080-\uffff]/g,
       (c) => `\\u${c.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0")}`,
     );
-    expect(classifyHttpError(400, escaped, undefined, "P", state).body).toBe('{"error":"bad state [redacted]"}');
+    expect(classifyHttpError(400, escaped, undefined, "P", state).body).toBe(WITHHELD);
   });
 
-  it("redacts a 12-character name quoted on its own", () => {
+  it("withholds a 12-character name quoted on its own", () => {
     const state = "Referral letter.\nPatient: Maria Garcia\nReason: chest pain on exertion, two weeks.";
     const text = JSON.stringify({ detail: "Unknown entity 'Maria Garcia'" });
-    expect(classifyHttpError(422, text, undefined, "P", state).body).toBe(
-      JSON.stringify({ detail: "Unknown entity '[redacted]'" }),
-    );
+    expect(classifyHttpError(422, text, undefined, "P", state).body).toBe(WITHHELD);
   });
 
-  it("redacts before truncating, so the cut cannot leave a short unredacted tail", () => {
-    const text = `${"x".repeat(1985)}${PATIENT} trailing`;
-    const error = classifyHttpError(500, text, undefined, "P", PATIENT);
-    expect(error.body!.startsWith(`${"x".repeat(1985)}[redacted]`)).toBe(true);
-    expect(error.body!.length).toBeLessThanOrEqual(2000);
-    expect(leaksState(error.body!, PATIENT)).toBe(false);
+  it("checks past the cut, so the truncation cannot leave a short tail of an echo in body", () => {
+    // Offset 1985 keeps 14 characters of the echo; 1992 keeps only "123-45-".
+    for (const offset of [1985, 1992, 1998]) {
+      const state = "123-45-6789 belongs to Maria Garcia, diagnosed with HIV in March. Follow-up next quarter.";
+      const error = classifyHttpError(500, `${"x".repeat(offset)}${state} trailing`, undefined, "P", state);
+      expect(error.body).toBe(WITHHELD);
+    }
+
+    // A JSON-escaped echo at 1990 keeps \"Maria\" (7 decoded characters).
+    const quoted = '"Maria" SSN 123-45-6789 is the patient on record for this referral.';
+    const escaped = `${"x".repeat(1990)}${JSON.stringify(quoted).slice(1, -1)}`;
+    expect(classifyHttpError(500, escaped, undefined, "P", quoted).body).toBe(WITHHELD);
+
+    // \u-escaped CJK, once (6 characters each) and twice (7 each), cut after a few characters.
+    const cjk = "診療記録：田中花子さん、東京都港区在住。二型糖尿病の経過観察中。";
+    const once = JSON.stringify(cjk).slice(1, -1).replace(/[\u0080-\uffff]/g, (c) => `\\u${c.charCodeAt(0).toString(16)}`);
+    const twice = once.replace(/\\/g, "\\\\");
+    for (const [echo, offset] of [
+      [once, 1960],
+      [twice, 1960],
+      [twice, 1995],
+    ] as const) {
+      expect(classifyHttpError(500, `${"x".repeat(offset)}${echo}`, undefined, "P", cjk).body).toBe(WITHHELD);
+    }
   });
 
-  it("property: an 8+ character fragment, raw, JSON-escaped, nested, or \\u-escaped, never survives", async () => {
+  describe("an echo escaped twice, as in OpenRouter's metadata.raw", () => {
+    /** Python's json.dumps default (ensure_ascii=True): every non-ASCII UTF-16 unit as \uXXXX. */
+    const pythonJson = (value: unknown): string =>
+      JSON.stringify(value).replace(/[\u0080-\uffff]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+    /** OpenRouter wraps the upstream body as a JSON string in error.metadata.raw. */
+    const openRouterWrap = (upstreamBody: string): string =>
+      JSON.stringify({
+        error: { code: 400, message: "Provider returned error", metadata: { raw: upstreamBody, provider_name: "Upstream" } },
+      });
+
+    it("withholds a Cyrillic state echoed by a Python upstream", () => {
+      const state = "Пациентка Иванова Мария, диагноз ВИЧ, наблюдается с марта, живёт в Казани.";
+      const body = openRouterWrap(pythonJson({ detail: `invalid state: ${state}` }));
+      // One decoded level still has \uXXXX between every character.
+      expect(body).toMatch(/^[\x20-\x7e]*$/);
+      expect(classifyHttpError(400, body, undefined, "OpenRouter", state).body).toBe(WITHHELD);
+    });
+
+    it("withholds a JSON-record state with no 8-character run free of quotes", () => {
+      const state = '{"dx":"HIV+","age":42,"pin":"4821","zip":"94107","sex":"F"}';
+      const body = openRouterWrap(JSON.stringify({ error: { message: `bad state: ${state}` } }));
+      expect(classifyHttpError(400, body, undefined, "OpenRouter", state).body).toBe(WITHHELD);
+    });
+
+    it("withholds a short-line CSV state end to end through OpenRouterJevTransport.decide", async () => {
+      const state = "id,dx\n1,HIV\n2,HCV\n3,TB\n4,HIV\n";
+      const fetchMock = fetchAlways(() =>
+        textResponse(openRouterWrap(JSON.stringify({ error: { message: `bad state: ${state}` } })), { status: 400 }),
+      );
+      const error = await providerErrorOf(
+        new OpenRouterJevTransport({ apiKey: "sk-or-test", fetch: fetchMock }).decide(request({ state })),
+      );
+      expect(error.message).toBe("OpenRouter request failed with HTTP 400 (bad_request)");
+      expect(error.body).toBe(WITHHELD);
+    });
+  });
+
+  it("property: an 8+ character fragment, raw, JSON-escaped, nested, or \\u-escaped, withholds the body", async () => {
+    const upperAscii = (text: string): string =>
+      text.replace(/[\u0080-\uffff]/g, (c) => `\\u${c.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0")}`);
+    const nest = (raw: string): string =>
+      JSON.stringify({ error: { message: "Provider returned error", metadata: { raw } } });
     await fc.assert(
       fc.asyncProperty(
         fc.string({ minLength: 40, maxLength: 300 }),
         fc.nat(),
         fc.integer({ min: 8, max: 40 }),
-        fc.constantFrom("raw", "json", "json-in-json", "upper-ascii-json"),
+        fc.constantFrom("raw", "json", "json-in-json", "upper-ascii-json", "upper-ascii-json-in-json"),
         fc.string({ maxLength: 30 }),
         async (state, offset, length, mode, prefix) => {
           const start = offset % (state.length - length + 1);
-          const message = `${prefix}${state.slice(start, start + length)} tail`;
+          const fragment = state.slice(start, start + length);
+          const message = `${prefix}${fragment} tail`;
           const json = JSON.stringify({ error: { message } });
           const bodyText =
             mode === "raw"
@@ -1579,12 +1703,16 @@ describe("regression: short, nested, and re-escaped state echoes (F01)", () => {
               : mode === "json"
                 ? json
                 : mode === "json-in-json"
-                  ? JSON.stringify({ error: { message: "Provider returned error", metadata: { raw: json } } })
-                  : json.replace(/[\u0080-￿]/g, (c) => `\\u${c.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0")}`);
+                  ? nest(json)
+                  : mode === "upper-ascii-json"
+                    ? upperAscii(json)
+                    : nest(upperAscii(json));
           const fetchMock = fetchAlways(() => textResponse(bodyText, { status: 400 }));
           const error = await providerErrorOf(postDecision(httpConfig(fetchMock), wireBody(state)));
           expect(error.message).toMatch(/^TestProvider request failed with HTTP 400 \((?:bad_request|context_limit)\)$/);
-          expect(leaksState(error.body ?? "", state)).toBe(false);
+          // Runs are compared with whitespace collapsed, so a fragment that is
+          // mostly whitespace can be too short to count.
+          if (fragment.replace(/\s+/g, " ").length >= GUARANTEED_RUN) expect(error.body).toBe(WITHHELD);
         },
       ),
       { numRuns: 300 },
@@ -1668,10 +1796,13 @@ describe("regression: header validation never exposes the value (F15)", () => {
   });
 });
 
-describe("regression: echoed document text does not choose the error kind (F16)", () => {
-  const LLM_DOC =
-    "Release notes. We raised the model's context window to 200k tokens and fixed the tokenizer cache. " +
-    "Nothing else in this release changes the public API.";
+describe("regression: echoed document text and the error kind (F16, superseded)", () => {
+  // The kind reads the body, echoes of the state included. A document with
+  // context-limit wording, echoed in a 400 or 422, can cause a spurious
+  // re-chunk; it still fails closed and never leaks the state. "overload" is
+  // read only for a 5xx or a code-less 2xx error, so an echo cannot make a
+  // deterministic 4xx retryable.
+  const sentence = "Section notes: the context window of the model was compared against the baseline run. ";
   const CPP_DOC =
     "Style guide. Prefer a free-function operator overload over a member when the left operand is not the class. " +
     "Keep overloaded operators consistent with the built-in semantics.";
@@ -1690,10 +1821,25 @@ describe("regression: echoed document text does not choose the error kind (F16)"
     });
   }
 
-  it("a 422 that echoes a state mentioning the context window is bad_request", () => {
-    const error = classifyHttpError(422, validationEcho(wireBody(LLM_DOC)), undefined, "P", LLM_DOC);
-    expect(error.kind).toBe("bad_request");
-    expect(error.retryable).toBe(false);
+  it("a 422 that echoes a state mentioning the context window is context_limit, with the body withheld", () => {
+    const error = classifyHttpError(422, validationEcho(wireBody(sentence)), undefined, "P", sentence);
+    expect(error.kind).toBe("context_limit");
+    expect(error.body).toBe(WITHHELD);
+    expect(error.message).toBe("P request failed with HTTP 422 (context_limit)");
+  });
+
+  it("decide() fails closed with JevContextBudgetError when every chunk's 422 echo mentions the context window", async () => {
+    const input = sentence.repeat(250);
+    const fetchMock = vi.fn<typeof fetch>(
+      async (_input, init) => new Response(validationEcho(JSON.parse(String(init?.body))), { status: 422 }),
+    );
+    const transport = new DirectJevTransport({ apiKey: "ts-test", fetch: fetchMock });
+    const error = await rejectionOf(decide({ input, question: NOUL, provider: { transport } }));
+    expect(error).toBeInstanceOf(JevContextBudgetError);
+    const cause = (error as JevContextBudgetError).cause as JevProviderError;
+    expect(cause.kind).toBe("context_limit");
+    expect(cause.body).toBe(WITHHELD);
+    expect(`${(error as Error).message}${cause.message}`).not.toContain("Section notes");
   });
 
   it("a 409 that echoes a state mentioning operator overloads is unknown and not retried", () => {
@@ -1701,40 +1847,30 @@ describe("regression: echoed document text does not choose the error kind (F16)"
     const error = classifyHttpError(409, body, undefined, "P", CPP_DOC);
     expect(error.kind).toBe("unknown");
     expect(error.retryable).toBe(false);
+    expect(error.body).toBe(WITHHELD);
   });
 
-  it("a code-less 2xx error object that echoes the state is unknown", () => {
-    const body = JSON.stringify({ error: { message: "Request rejected", request: wireBody(CPP_DOC) } });
-    expect(classifyHttpError(undefined, body, undefined, "P", CPP_DOC).kind).toBe("unknown");
-  });
-
-  it("postDecision reports a 422 echo of the request as bad_request", async () => {
-    const fetchMock = vi.fn<typeof fetch>(
-      async (_input, init) => new Response(validationEcho(JSON.parse(String(init?.body))), { status: 422 }),
-    );
-    const error = await providerErrorOf(postDecision(httpConfig(fetchMock), wireBody(LLM_DOC)));
-    expect(error.kind).toBe("bad_request");
-  });
-
-  it("still reads the provider's own wording when the document shares a short run of it", () => {
-    const doc = "Planning notes: the maximum context length is the most important model limit, so we track it per model.";
-    const body = JSON.stringify({ error: { code: 400, message: "This endpoint's maximum context length is 32768 tokens." } });
-    expect(classifyHttpError(400, body, undefined, "P", doc).kind).toBe("context_limit");
-  });
-
-  it("decide() fails a deterministic 422 echo at once instead of re-chunking to JevContextBudgetError", async () => {
-    // Every sentence mentions the context window, so every chunk's echo would match.
-    const sentence = "Section notes: the context window of the model was compared against the baseline run. ";
-    const input = sentence.repeat(250);
-    const fetchMock = vi.fn<typeof fetch>(
-      async (_input, init) => new Response(validationEcho(JSON.parse(String(init?.body))), { status: 422 }),
-    );
+  it("decide() sends a deterministic 409 that echoes such a state once", async () => {
+    const fetchMock = vi.fn<typeof fetch>(async (_input, init) => {
+      const sent = JSON.parse(String(init?.body)) as { state: string };
+      return new Response(JSON.stringify({ error: { message: "Conflict" }, request: { state: sent.state } }), {
+        status: 409,
+      });
+    });
     const transport = new DirectJevTransport({ apiKey: "ts-test", fetch: fetchMock });
-    const error = await rejectionOf(decide({ input, question: NOUL, provider: { transport } }));
-    expect(error).not.toBeInstanceOf(JevContextBudgetError);
+    const error = await rejectionOf(
+      decide({ input: CPP_DOC, question: NOUL, provider: { transport }, execution: { retryBaseDelayMs: 0 } }),
+    );
     expect(error).toBeInstanceOf(JevChunkFailedError);
-    expect(((error as JevChunkFailedError).cause as JevProviderError).kind).toBe("bad_request");
+    expect(((error as JevChunkFailedError).cause as JevProviderError).kind).toBe("unknown");
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("still reads a provider's own \"overloaded\" in a 5xx or a code-less 2xx error", () => {
+    const body = JSON.stringify({ error: { message: "Model is overloaded, try again" } });
+    expect(classifyHttpError(500, body, undefined, "P", CPP_DOC).kind).toBe("overloaded");
+    expect(classifyHttpError(undefined, body, undefined, "P", CPP_DOC).kind).toBe("overloaded");
+    expect(classifyHttpError(409, body, undefined, "P").kind).toBe("unknown");
   });
 });
 
@@ -1775,6 +1911,84 @@ describe("regression: count-based over-length wordings re-chunk (F17)", () => {
       expect(result.usage.rechunks).toBeGreaterThan(0);
     },
   );
+});
+
+describe("regression: provider text that may echo the state stays out of the error chain", () => {
+  const REFERRAL = "Referral. SSN 123-45-6789, Maria Garcia, HIV positive since March; follow-up with endocrinology.";
+  const COPIED = "SSN 123-45-6789, Maria Garcia";
+
+  it("drops the SyntaxError of a non-JSON 2xx, whose message quotes the body", async () => {
+    const fetchMock = fetchAlways(() => textResponse(COPIED));
+    const error = await providerErrorOf(postDecision(httpConfig(fetchMock), wireBody(REFERRAL)));
+    expect(error.kind).toBe("invalid_response");
+    expect(error.body).toBe(WITHHELD);
+    expect(error.cause).toBeUndefined();
+    expect(inspect(error)).not.toContain("123-45");
+  });
+
+  it("drops the SyntaxError of a malformed 2xx JSON, whose message quotes a window of it", async () => {
+    const fetchMock = fetchAlways(() => textResponse('{"model":"m","note": SSN 123-45-6789 of Maria}'));
+    const error = await providerErrorOf(postDecision(httpConfig(fetchMock), wireBody(REFERRAL)));
+    expect(error.cause).toBeUndefined();
+    expect(inspect(error)).not.toContain("123-45");
+  });
+
+  it("describes a provider `type` string by length only", async () => {
+    const fetchMock = fetchAlways(() => jsonResponse({ model: "m", answers: { decision: { type: COPIED } } }));
+    const error = await providerErrorOf(postDecision(httpConfig(fetchMock), wireBody(REFERRAL)));
+    expect(error.message).toBe(
+      'TestProvider returned an invalid decision response: answers["decision"].type must be "choice", "score", or "noul", got a string of length 29',
+    );
+  });
+
+  it("quotes a response key only when the request sent it", async () => {
+    const body: JsonObject = {
+      ...wireBody(REFERRAL),
+      questions: {
+        decision: { type: "choice", instructions: "Which team?", criteria: { a: "team a", b: "team b" } },
+        level: { type: "score", instructions: "How urgent?", criteria: ["low", "high"] },
+      },
+    };
+    const messageFor = async (answers: unknown): Promise<string> =>
+      (await providerErrorOf(postDecision(httpConfig(fetchAlways(() => jsonResponse({ model: "m", answers }))), body)))
+        .message;
+
+    expect(await messageFor({ [COPIED]: { type: "noul", noul: "x" } })).toContain(
+      "answers[<unknown key of length 29>].noul must be a finite number",
+    );
+    expect(await messageFor({ decision: { type: "choice", choice: "a", probabilities: { a: 1, [COPIED]: "x" } } })).toContain(
+      'answers["decision"].probabilities[<unknown key of length 29>] must be a finite number',
+    );
+    expect(await messageFor({ decision: { type: "choice", choice: "a", probabilities: { a: "x" } } })).toContain(
+      'answers["decision"].probabilities["a"] must be a finite number',
+    );
+    expect(await messageFor({ level: { type: "score", score: 1, legend: { "1": 5 } } })).toContain(
+      'answers["level"].legend["1"] must be a string, object, or array',
+    );
+    expect(await messageFor({ level: { type: "score", score: 1, legend: { [COPIED]: 5 } } })).toContain(
+      'answers["level"].legend[<unknown key of length 29>] must be a string, object, or array',
+    );
+  });
+
+  it("keeps a provider `choice` copied from the document out of JevChunkFailedError", async () => {
+    const fetchMock = fetchAlways(() =>
+      jsonResponse({ model: "m", answers: { decision: { type: "choice", choice: COPIED } } }),
+    );
+    const transport = new DirectJevTransport({ apiKey: "ts-test", fetch: fetchMock });
+    const error = await rejectionOf(
+      decide({
+        input: REFERRAL,
+        question: { type: "choice", instructions: "Which team?", criteria: { a: "team a", b: "team b" } },
+        provider: { transport },
+        execution: { retryBaseDelayMs: 0 },
+      }),
+    );
+    expect(error).toBeInstanceOf(JevChunkFailedError);
+    expect(((error as JevChunkFailedError).cause as Error).message).toBe(
+      "Jev choice a string of length 29 is not one of the question's criteria keys.",
+    );
+    expect(inspect(error)).not.toContain("123-45");
+  });
 });
 
 describe("regression: transport options accept an explicit undefined (F23)", () => {

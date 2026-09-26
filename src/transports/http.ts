@@ -5,10 +5,8 @@
  *
  * Invariant: no error message created here quotes provider text for a request
  * that carried state, so messages never contain it (spec 16: never log source
- * text). A provider can quote any fragment of the state, and a short one
- * cannot be told apart from ordinary words, so `body` is scrubbed on a
- * best-effort basis: every run of MIN_ECHO_RUN or more characters shared with
- * the state is redacted, including runs hidden by JSON escaping.
+ * text). An error's `body` keeps provider text only when it shares no run of
+ * ECHO_RUN characters with the state; otherwise the whole body is withheld.
  */
 
 import {
@@ -17,6 +15,7 @@ import {
   JevValidationError,
   type ProviderErrorKind,
 } from "../errors.js";
+import { isRecord, MAX_TIMER_DELAY_MS, own, quote, raceAbort } from "../internal.js";
 import type {
   JevCriterion,
   JevQuestion,
@@ -40,8 +39,6 @@ export interface HttpDecisionConfig {
 export const MAX_ERROR_BODY_CHARS = 2000;
 /** Longest provider message quoted in an error's `message`. */
 const MAX_ERROR_DETAIL_CHARS = 300;
-/** setTimeout clamps larger delays to 1 ms, so they cannot be honored. */
-const MAX_TIMER_MS = 2_147_483_647;
 
 // ---------------------------------------------------------------------------
 // Decision request
@@ -61,7 +58,7 @@ export async function postDecision(
   body: JsonObject,
   signal?: AbortSignal,
 ): Promise<NativeJevResponse> {
-  const secret = stateSecret(body);
+  const state = requestState(body);
   const { response, text } = await fetchText(
     config.fetch,
     config.url,
@@ -70,21 +67,24 @@ export async function postDecision(
   );
 
   if (!response.ok) {
-    throw classifyHttpError(response.status, text, response.headers, config.providerName, secret);
+    throw classifyHttpError(response.status, text, response.headers, config.providerName, state);
   }
 
   let json: unknown;
   try {
     json = JSON.parse(text);
-  } catch (error) {
+  } catch {
+    // The SyntaxError is dropped rather than kept as `cause`: its message
+    // quotes the body (all of a short one, a window of a long one), which can
+    // echo the state, and loggers print the cause chain. The body itself is
+    // on `body`, withheld when it echoes the state.
     throw new JevProviderError(
       `${config.providerName} returned a response body that is not valid JSON (HTTP ${response.status})`,
       {
         kind: "invalid_response",
         status: response.status,
         retryable: false,
-        body: redactBody(text, secret),
-        cause: error,
+        body: errorBody(text, state),
       },
     );
   }
@@ -100,12 +100,12 @@ export async function postDecision(
         text,
         response.headers,
         config.providerName,
-        secret,
+        state,
       );
     }
   }
 
-  return parseNativeResponse(json, config.providerName);
+  return parseNativeResponse(json, config.providerName, requestLabels(body));
 }
 
 /**
@@ -183,7 +183,7 @@ export async function fetchText(
 ): Promise<{ response: Response; text: string }> {
   const { signal, providerName, timeoutMs } = options;
   if (!isValidTimerDelay(timeoutMs)) {
-    throw new JevValidationError(`${providerName}: timeoutMs must be a number of milliseconds in (0, ${MAX_TIMER_MS}]`);
+    throw new JevValidationError(`${providerName}: timeoutMs must be a number of milliseconds in (0, ${MAX_TIMER_DELAY_MS}]`);
   }
   if (signal?.aborted) {
     throw new JevAbortError(`${providerName} request was aborted before it was sent`, {
@@ -230,29 +230,6 @@ export async function fetchText(
   }
 }
 
-/** Settles with `promise`, or rejects as soon as `signal` aborts. Never leaves a rejection unhandled. */
-function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    if (signal.aborted) {
-      promise.catch(() => undefined);
-      reject(signal.reason);
-      return;
-    }
-    const onAbort = (): void => reject(signal.reason);
-    signal.addEventListener("abort", onAbort, { once: true });
-    promise.then(
-      (value) => {
-        signal.removeEventListener("abort", onAbort);
-        resolve(value);
-      },
-      (error: unknown) => {
-        signal.removeEventListener("abort", onAbort);
-        reject(error);
-      },
-    );
-  });
-}
-
 function describeNetworkError(error: unknown): string {
   const name = error instanceof Error ? error.name : typeof error;
   const cause: unknown = error instanceof Error ? error.cause : undefined;
@@ -268,28 +245,28 @@ function describeNetworkError(error: unknown): string {
 /**
  * Maps a failed provider response to a `JevProviderError` (spec 7 error
  * behavior). `status` is undefined for a 2xx body whose `error` object has no
- * numeric code. `redact` is the request state. When it is given, the message
- * names only the provider, status, and kind, echoes of the state are redacted
- * from `body`, and long echoes are ignored when choosing the kind, so the
- * document's own wording cannot make a 4xx look like a context-limit error or
- * an overload.
+ * numeric code. `state` is the request state. When it is non-empty, the
+ * message names only the provider, status, and kind, and `body` is withheld
+ * if it echoes the state (see `errorBody`).
  */
 export function classifyHttpError(
   status: number | undefined,
   bodyText: string,
   headers: Headers | undefined,
   providerName: string,
-  redact?: string,
+  state?: string,
 ): JevProviderError {
-  const text = scanWindow(bodyText);
-  // An empty body has nothing to scan, so the state is not indexed for it.
-  const index = text === "" ? undefined : echoIndex(redact);
-  const echoes = index === undefined ? undefined : scanEchoes(text, index, true);
-  const kind = kindForStatus(status, echoes === undefined ? text : replaceRanges(text, echoes.strip, ECHO_SEPARATOR));
+  const scanned = bodyText.length > MAX_SCAN_CHARS ? bodyText.slice(0, MAX_SCAN_CHARS) : bodyText;
+  // The kind reads the scanned body, echoes of the state included. An echoed
+  // document with context-limit wording can make a 400 or 422 a spurious
+  // context_limit (a re-chunk that still fails closed, with
+  // JevContextBudgetError at worst). One mentioning "overload" can make a 5xx
+  // or a code-less 2xx error `overloaded` (retryable either way for a 5xx).
+  const kind = kindForStatus(status, scanned);
   // Provider text can quote any fragment of the state, including ones too
   // short to find, and messages are what callers log (JevChunkFailedError
-  // quotes this one). It stays, redacted, on `body` instead.
-  const detail = index === undefined ? quotedDetail(providerMessage(text)) : undefined;
+  // quotes this one).
+  const detail = state === undefined || state === "" ? quotedDetail(providerMessage(scanned)) : undefined;
   const head =
     status === undefined
       ? `${providerName} returned an error (${kind})`
@@ -298,7 +275,7 @@ export function classifyHttpError(
     kind,
     status,
     retryAfterMs: parseRetryAfter(headers?.get("retry-after")),
-    body: redactedBody(text, index, echoes?.redact ?? []),
+    body: errorBody(bodyText, state),
   });
 }
 
@@ -318,8 +295,10 @@ function kindForStatus(status: number | undefined, text: string): ProviderErrorK
   if (status === 404) return "not_found";
   if (status === 408) return "timeout";
   if (status === 429) return "rate_limit";
-  if (status === 503 || status === 529 || OVERLOAD_PATTERN.test(text)) return "overloaded";
-  if (status >= 500 && status <= 599) return "server";
+  if (status === 503 || status === 529) return "overloaded";
+  // Only a 5xx is read for "overload": an unlisted 4xx is a client error, and
+  // an echo of the state must not make it retryable.
+  if (status >= 500 && status <= 599) return OVERLOAD_PATTERN.test(text) ? "overloaded" : "server";
   return "unknown";
 }
 
@@ -408,49 +387,49 @@ function providerMessage(bodyText: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// State redaction (spec 16)
+// Error bodies and state echoes (spec 16)
 // ---------------------------------------------------------------------------
 
-const REDACTION_MARKER = "[redacted]";
+/** Kept on `body` in place of a provider body that echoes the request state. */
+const WITHHELD_BODY = "[withheld: provider error body overlaps the request state]";
 /**
- * Shortest run of characters shared with the state that `body` treats as an
- * echo. Every such run is found, at any offset. Shorter fragments cannot be
- * told apart from ordinary words, which is why messages never quote provider
- * text for a request that carried state.
+ * Shortest run of characters shared with the state that withholds a body.
+ * Shorter fragments cannot be told apart from ordinary words, which is why
+ * messages never quote provider text for a request that carried state.
  */
-const MIN_ECHO_RUN = 8;
+const ECHO_RUN = 8;
 /**
- * Shortest shared run ignored when classifying. Longer than MIN_ECHO_RUN
- * because a provider's own wording ("maximum context length") can also occur
- * in the document, and ignoring that coincidence would hide a genuine
- * context-limit error. A real echo is the state or a long slice of it.
+ * Characters past the cut that are also checked for echoes, so an echo cut
+ * short by the truncation is still found. ECHO_RUN characters escaped twice
+ * as \uXXXX (7 characters each) fit, and so do three levels (9 each).
  */
-const MIN_CLASSIFY_ECHO_RUN = 32;
+const ECHO_CUT_SLACK = 128;
 /**
- * Levels of JSON escaping undone when looking for echoes: one for a state
- * quoted in a JSON string, two for a JSON body nested in a JSON string (as in
- * OpenRouter's `metadata.raw`), and one spare.
+ * Levels of JSON string escaping undone when looking for echoes: one for a
+ * state quoted in a JSON string, two for a JSON body nested in a JSON string
+ * (as in OpenRouter's `metadata.raw`), and one spare.
  */
 const MAX_UNESCAPE_LEVELS = 3;
-/** Longest prefix of a provider body that is scanned for echoes and classified. */
+/** Longest prefix of a provider body that is classified and searched for a message to quote. */
 const MAX_SCAN_CHARS = 1_000_000;
-/** Stands in for an ignored echo; no context-limit or overload pattern matches across it. */
-const ECHO_SEPARATOR = "\n.\n";
+/** One JSON string escape: \uXXXX (hex in either case) or a one-character escape. */
+const JSON_ESCAPE = /\\(?:u[0-9a-fA-F]{4}|["\\/bfnrt])/g;
 
-/** The text that must never appear in an error built for this body. */
-function stateSecret(body: JsonObject): string | undefined {
+/** The text an error built for this body must not echo; undefined when the request carried no state. */
+function requestState(body: JsonObject): string | undefined {
   const state = own(body, "state");
   if (state === undefined || state === "") return undefined;
   return typeof state === "string" ? state : JSON.stringify(state);
 }
 
-function scanWindow(text: string): string {
-  return text.length > MAX_SCAN_CHARS ? text.slice(0, MAX_SCAN_CHARS) : text;
-}
-
-/** Collapses whitespace and truncates a provider message; undefined when empty. */
+/**
+ * Collapses whitespace and truncates a provider message; undefined when
+ * empty. The message is cut before whitespace is collapsed, so the cost does
+ * not grow with the body.
+ */
 function quotedDetail(text: string): string | undefined {
-  const cleaned = truncate(text.replace(/\s+/g, " ").trim(), MAX_ERROR_DETAIL_CHARS);
+  const head = truncate(text.trimStart(), 4 * MAX_ERROR_DETAIL_CHARS);
+  const cleaned = truncate(collapseWhitespace(head).trim(), MAX_ERROR_DETAIL_CHARS);
   return cleaned === "" ? undefined : cleaned;
 }
 
@@ -463,253 +442,60 @@ function truncate(text: string, maxChars: number): string {
   return `${text.slice(0, end)}…`;
 }
 
-/** A provider body kept on an error: echoes of `secret` redacted, then truncated. */
-function redactBody(bodyText: string, secret: string | undefined): string | undefined {
-  const text = scanWindow(bodyText);
-  const index = text === "" ? undefined : echoIndex(secret);
-  return redactedBody(text, index, index === undefined ? [] : scanEchoes(text, index, false).redact);
+/**
+ * The provider body kept on an error: truncated to MAX_ERROR_BODY_CHARS and,
+ * for a request that carried state, replaced as a whole by WITHHELD_BODY when
+ * it echoes the state (fail-closed: nothing is partially redacted). The check
+ * also reads ECHO_CUT_SLACK characters past the cut, so the truncation cannot
+ * leave an echo too short to find. Undefined for an empty body.
+ */
+function errorBody(bodyText: string, state: string | undefined): string | undefined {
+  const kept = truncate(bodyText, MAX_ERROR_BODY_CHARS);
+  if (kept === "") return undefined;
+  if (state === undefined || state === "") return kept;
+  return echoesState(bodyText.slice(0, MAX_ERROR_BODY_CHARS + ECHO_CUT_SLACK), state) ? WITHHELD_BODY : kept;
 }
 
 /**
- * Replaces `echoes` with a marker and truncates; undefined for an empty
- * result. Redaction runs before truncation so that a cut cannot leave an
- * echo too short to find. If the marker would itself spell out the state (a
- * state as short as "e"), the body is withheld entirely.
+ * True when a run of ECHO_RUN characters of `text`, as sent or with up to
+ * MAX_UNESCAPE_LEVELS levels of JSON string escapes decoded, also occurs in
+ * `state`, with whitespace collapsed to one space in all of them. A state
+ * shorter than ECHO_RUN matches when it occurs whole. The text's runs go in a
+ * set and the state is scanned once, so the cost is
+ * O(MAX_UNESCAPE_LEVELS * |text| + |state|).
  */
-function redactedBody(text: string, index: EchoIndex | undefined, echoes: readonly Range[]): string | undefined {
-  const redacted = replaceRanges(text, echoes, REDACTION_MARKER);
-  if (index !== undefined && index.grams === undefined && scanEchoes(redacted, index, false).redact.length > 0) {
-    return undefined;
+function echoesState(text: string, state: string): boolean {
+  const target = collapseWhitespace(state);
+  const decoded = [text];
+  for (let level = 1; level <= MAX_UNESCAPE_LEVELS; level += 1) {
+    const previous = decoded[decoded.length - 1]!;
+    const next = decodeJsonEscapes(previous);
+    if (next === previous) break;
+    decoded.push(next);
   }
-  const kept = truncate(redacted, MAX_ERROR_BODY_CHARS);
-  return kept === "" ? undefined : kept;
+  const views = decoded.map(collapseWhitespace);
+  if (target.length < ECHO_RUN) return views.some((view) => view.includes(target));
+  const runs = new Set<string>();
+  for (const view of views) {
+    for (let i = 0; i + ECHO_RUN <= view.length; i += 1) runs.add(view.slice(i, i + ECHO_RUN));
+  }
+  for (let i = 0; i + ECHO_RUN <= target.length; i += 1) {
+    if (runs.has(target.slice(i, i + ECHO_RUN))) return true;
+  }
+  return false;
 }
 
-/** The request state, prepared for finding echoes of it. */
-interface EchoIndex {
-  /** The state with each whitespace run collapsed to one space. */
-  readonly text: string;
-  /** Every MIN_ECHO_RUN-character substring of `text`; undefined when `text` is shorter. */
-  readonly grams: ReadonlySet<string> | undefined;
-  /** Every MIN_CLASSIFY_ECHO_RUN-character substring, built on first use. */
-  classifyGrams: ReadonlySet<string> | undefined;
-}
-
-function echoIndex(secret: string | undefined): EchoIndex | undefined {
-  if (secret === undefined || secret === "") return undefined;
-  const text = makeView(secret, undefined, false).text;
-  return {
-    text,
-    grams: text.length < MIN_ECHO_RUN ? undefined : substrings(text, MIN_ECHO_RUN),
-    classifyGrams: undefined,
-  };
-}
-
-function substrings(text: string, length: number): Set<string> {
-  const set = new Set<string>();
-  for (let i = 0; i + length <= text.length; i += 1) set.add(text.slice(i, i + length));
-  return set;
-}
-
-/** Offsets [start, end) into the scanned provider text. */
-type Range = [start: number, end: number];
-
-interface EchoScan {
-  /** Echoes to redact from `body`: every run of MIN_ECHO_RUN or more shared characters. */
-  redact: Range[];
-  /** Echoes to ignore when classifying: runs of MIN_CLASSIFY_ECHO_RUN or more, or the whole state. */
-  strip: Range[];
+function collapseWhitespace(text: string): string {
+  return text.replace(/\s+/g, " ");
 }
 
 /**
- * Finds echoes of the state in `text` and in successively unescaped views of
- * it, so an echo is found whether it is raw, JSON-escaped once or twice,
- * \u-escaped in either case (Python, Go's <, .NET), or re-wrapped.
- * A state shorter than MIN_ECHO_RUN is only matched whole.
+ * Undoes one level of JSON string escaping, as applied when a provider quotes
+ * the state in a JSON message. Each \u unit is decoded on its own, so an
+ * escaped surrogate pair becomes the original character again.
  */
-function scanEchoes(text: string, index: EchoIndex, classify: boolean): EchoScan {
-  const redact: Range[] = [];
-  const strip: Range[] = [];
-  forEachView(text, (view) => {
-    if (index.grams === undefined) {
-      occurrences(view, index.text, redact);
-      return;
-    }
-    const longest = sharedRuns(view, index.grams, MIN_ECHO_RUN, redact);
-    if (!classify || longest < Math.min(index.text.length, MIN_CLASSIFY_ECHO_RUN)) return;
-    if (index.text.length < MIN_CLASSIFY_ECHO_RUN) {
-      occurrences(view, index.text, strip);
-    } else {
-      index.classifyGrams ??= substrings(index.text, MIN_CLASSIFY_ECHO_RUN);
-      sharedRuns(view, index.classifyGrams, MIN_CLASSIFY_ECHO_RUN, strip);
-    }
-  });
-  return { redact: mergeRanges(redact), strip: mergeRanges(strip) };
-}
-
-/**
- * A normalized copy of provider text: each whitespace run collapsed to one
- * space (a provider may re-wrap an echo) and, when `unescape` is set, one
- * level of JSON escaping undone. Character j came from original offsets
- * [start[j], end[j]), so a match in the view maps back to what it replaces.
- */
-interface View {
-  readonly text: string;
-  readonly start: Int32Array;
-  readonly end: Int32Array;
-}
-
-/** Calls `visit` with the text's view at each escaping level, stopping once nothing is left to unescape. */
-function forEachView(text: string, visit: (view: View) => void): void {
-  let view = makeView(text, undefined, false);
-  visit(view);
-  for (let level = 1; level <= MAX_UNESCAPE_LEVELS && view.text.includes("\\"); level += 1) {
-    const next = makeView(view.text, view, true);
-    // Every undone escape shortens the text, so an equal length means none was.
-    if (next.text.length === view.text.length) return;
-    view = next;
-    visit(view);
-  }
-}
-
-/** Builds a view of `source`, which is `parent`'s text (offsets then map through `parent`) or the original. */
-function makeView(source: string, parent: View | undefined, unescape: boolean): View {
-  const codes = new Uint16Array(source.length);
-  const start = new Int32Array(source.length);
-  const end = new Int32Array(source.length);
-  let length = 0;
-  let i = 0;
-  while (i < source.length) {
-    let code = source.charCodeAt(i);
-    let next = i + 1;
-    if (unescape && code === 0x5c) {
-      const escaped = unescapeAt(source, i);
-      if (escaped !== undefined) [code, next] = escaped;
-    }
-    const from = parent === undefined ? i : parent.start[i]!;
-    const to = parent === undefined ? next : parent.end[next - 1]!;
-    const space = isWhitespace(code);
-    if (space && length > 0 && codes[length - 1] === 0x20) {
-      end[length - 1] = to;
-    } else {
-      codes[length] = space ? 0x20 : code;
-      start[length] = from;
-      end[length] = to;
-      length += 1;
-    }
-    i = next;
-  }
-  let text = "";
-  for (let at = 0; at < length; at += 8192) {
-    text += String.fromCharCode(...codes.subarray(at, Math.min(length, at + 8192)));
-  }
-  return { text, start: start.subarray(0, length), end: end.subarray(0, length) };
-}
-
-/** The character a JSON escape at `i` stands for (hex in either case) and the offset after it. */
-function unescapeAt(text: string, i: number): [code: number, next: number] | undefined {
-  const code = text.charCodeAt(i + 1);
-  switch (code) {
-    case 0x22: // "
-    case 0x2f: // /
-    case 0x5c: // \
-      return [code, i + 2];
-    case 0x62: // b
-      return [0x08, i + 2];
-    case 0x66: // f
-      return [0x0c, i + 2];
-    case 0x6e: // n
-      return [0x0a, i + 2];
-    case 0x72: // r
-      return [0x0d, i + 2];
-    case 0x74: // t
-      return [0x09, i + 2];
-    case 0x75: {
-      // u
-      const hex = text.slice(i + 2, i + 6);
-      return /^[0-9a-f]{4}$/i.test(hex) ? [Number.parseInt(hex, 16), i + 6] : undefined;
-    }
-    default:
-      return undefined;
-  }
-}
-
-/** Same set as the regular expression class \s. */
-function isWhitespace(code: number): boolean {
-  return (
-    (code >= 0x09 && code <= 0x0d) ||
-    code === 0x20 ||
-    code === 0xa0 ||
-    code === 0x1680 ||
-    (code >= 0x2000 && code <= 0x200a) ||
-    code === 0x2028 ||
-    code === 0x2029 ||
-    code === 0x202f ||
-    code === 0x205f ||
-    code === 0x3000 ||
-    code === 0xfeff
-  );
-}
-
-/**
- * Appends the original ranges of `view` covered by `size`-character
- * substrings that also occur in the state, merging overlapping or touching
- * ones, so every shared run of at least `size` characters is covered end to
- * end. Returns the longest merged run, in view characters.
- */
-function sharedRuns(view: View, grams: ReadonlySet<string>, size: number, out: Range[]): number {
-  const text = view.text;
-  let longest = 0;
-  let runStart = -1;
-  let runEnd = -1;
-  const flush = (): void => {
-    if (runStart < 0) return;
-    out.push([view.start[runStart]!, view.end[runEnd - 1]!]);
-    longest = Math.max(longest, runEnd - runStart);
-  };
-  for (let i = 0; i + size <= text.length; i += 1) {
-    if (!grams.has(text.slice(i, i + size))) continue;
-    if (runStart >= 0 && i <= runEnd) {
-      runEnd = i + size;
-    } else {
-      flush();
-      runStart = i;
-      runEnd = i + size;
-    }
-  }
-  flush();
-  return longest;
-}
-
-/** Appends the original range of every occurrence of `needle` in `view`. */
-function occurrences(view: View, needle: string, out: Range[]): void {
-  for (let at = view.text.indexOf(needle); at >= 0; at = view.text.indexOf(needle, at + 1)) {
-    out.push([view.start[at]!, view.end[at + needle.length - 1]!]);
-  }
-}
-
-/** Sorts ranges and merges overlapping or touching ones, so adjacent echoes become one. */
-function mergeRanges(ranges: Range[]): Range[] {
-  ranges.sort((a, b) => a[0] - b[0]);
-  const merged: Range[] = [];
-  for (const [start, end] of ranges) {
-    const last = merged[merged.length - 1];
-    if (last !== undefined && start <= last[1]) last[1] = Math.max(last[1], end);
-    else merged.push([start, end]);
-  }
-  return merged;
-}
-
-/** Replaces each of the sorted, disjoint `ranges` of `text` with `replacement`. */
-function replaceRanges(text: string, ranges: readonly Range[], replacement: string): string {
-  if (ranges.length === 0) return text;
-  let out = "";
-  let cursor = 0;
-  for (const [start, end] of ranges) {
-    out += text.slice(cursor, start) + replacement;
-    cursor = end;
-  }
-  return out + text.slice(cursor);
+function decodeJsonEscapes(text: string): string {
+  return text.replace(JSON_ESCAPE, (escape) => JSON.parse(`"${escape}"`) as string);
 }
 
 // ---------------------------------------------------------------------------
@@ -721,13 +507,22 @@ function replaceRanges(text: string, ranges: readonly Range[], replacement: stri
  * `NativeJevResponse` (camelCase usage). Structural only: probability ranges
  * and option membership are checked later against the question (spec 8).
  * Throws `JevProviderError` kind "invalid_response" (not retryable).
+ *
+ * `known` holds the strings the request itself sent as keys (see
+ * `requestLabels`). A message quotes a response key only when it is one of
+ * them: the provider may have copied any other string from the state.
  */
-export function parseNativeResponse(raw: unknown, providerName: string): NativeJevResponse {
+export function parseNativeResponse(
+  raw: unknown,
+  providerName: string,
+  known: ReadonlySet<string> = new Set(),
+): NativeJevResponse {
   const fail = (problem: string): JevProviderError =>
     new JevProviderError(`${providerName} returned an invalid decision response: ${problem}`, {
       kind: "invalid_response",
       retryable: false,
     });
+  const keyName: KeyName = (key) => (known.has(key) ? quote(key) : `<unknown key of length ${key.length}>`);
 
   if (!isRecord(raw)) throw fail(`expected a JSON object, got ${describe(raw)}`);
 
@@ -738,7 +533,7 @@ export function parseNativeResponse(raw: unknown, providerName: string): NativeJ
   if (!isRecord(answers)) throw fail(`\`answers\` must be an object, got ${describe(answers)}`);
 
   const parsedAnswers: Record<string, NativeJevAnswer> = Object.fromEntries(
-    Object.entries(answers).map(([key, value]) => [key, parseAnswer(`answers[${quote(key)}]`, value, fail)]),
+    Object.entries(answers).map(([key, value]) => [key, parseAnswer(`answers[${keyName(key)}]`, value, fail, keyName)]),
   );
 
   const id = own(raw, "id");
@@ -754,8 +549,32 @@ export function parseNativeResponse(raw: unknown, providerName: string): NativeJ
 }
 
 type Fail = (problem: string) => JevProviderError;
+/** Renders a response key for an error path. */
+type KeyName = (key: string) => string;
 
-function parseAnswer(path: string, value: unknown, fail: Fail): NativeJevAnswer {
+/**
+ * The strings a request sent as keys: its question keys, the keys of object
+ * criteria (choice options, and "true" and "false" for noul), and the level
+ * indices of array criteria (score). A response key among them is the
+ * caller's own text, so an error message may quote it.
+ */
+function requestLabels(body: JsonObject): Set<string> {
+  const labels = new Set<string>();
+  const questions = own(body, "questions");
+  if (!isRecord(questions)) return labels;
+  for (const [key, question] of Object.entries(questions)) {
+    labels.add(key);
+    const criteria = isRecord(question) ? own(question, "criteria") : undefined;
+    if (isRecord(criteria)) {
+      for (const label of Object.keys(criteria)) labels.add(label);
+    } else if (Array.isArray(criteria)) {
+      for (let level = 0; level < criteria.length; level += 1) labels.add(String(level));
+    }
+  }
+  return labels;
+}
+
+function parseAnswer(path: string, value: unknown, fail: Fail, keyName: KeyName): NativeJevAnswer {
   if (!isRecord(value)) throw fail(`${path} must be an object, got ${describe(value)}`);
   const type = own(value, "type");
   switch (type) {
@@ -766,7 +585,7 @@ function parseAnswer(path: string, value: unknown, fail: Fail): NativeJevAnswer 
     case "choice": {
       const choice = own(value, "choice");
       if (typeof choice !== "string") throw fail(`${path}.choice must be a string, got ${describe(choice)}`);
-      const probabilities = optionalNumberMap(`${path}.probabilities`, own(value, "probabilities"), fail);
+      const probabilities = optionalNumberMap(`${path}.probabilities`, own(value, "probabilities"), fail, keyName);
       const confidence = optionalFinite(`${path}.confidence`, own(value, "confidence"), fail);
       return {
         type: "choice",
@@ -777,8 +596,8 @@ function parseAnswer(path: string, value: unknown, fail: Fail): NativeJevAnswer 
     }
     case "score": {
       const score = requireFinite(`${path}.score`, own(value, "score"), fail);
-      const probabilities = optionalNumberMap(`${path}.probabilities`, own(value, "probabilities"), fail);
-      const legend = optionalLegend(`${path}.legend`, own(value, "legend"), fail);
+      const probabilities = optionalNumberMap(`${path}.probabilities`, own(value, "probabilities"), fail, keyName);
+      const legend = optionalLegend(`${path}.legend`, own(value, "legend"), fail, keyName);
       const confidence = optionalFinite(`${path}.confidence`, own(value, "confidence"), fail);
       return {
         type: "score",
@@ -789,7 +608,8 @@ function parseAnswer(path: string, value: unknown, fail: Fail): NativeJevAnswer 
       };
     }
     default:
-      throw fail(`${path}.type must be "choice", "score", or "noul", got ${describeType(type)}`);
+      // Any other type string came from the provider, so only its length is shown.
+      throw fail(`${path}.type must be "choice", "score", or "noul", got ${describe(type)}`);
   }
 }
 
@@ -805,21 +625,31 @@ function optionalFinite(path: string, value: unknown, fail: Fail): number | unde
   return value === undefined || value === null ? undefined : requireFinite(path, value, fail);
 }
 
-function optionalNumberMap(path: string, value: unknown, fail: Fail): Record<string, number> | undefined {
+function optionalNumberMap(
+  path: string,
+  value: unknown,
+  fail: Fail,
+  keyName: KeyName,
+): Record<string, number> | undefined {
   if (value === undefined || value === null) return undefined;
   if (!isRecord(value)) throw fail(`${path} must be an object, got ${describe(value)}`);
   return Object.fromEntries(
-    Object.entries(value).map(([key, entry]) => [key, requireFinite(`${path}[${quote(key)}]`, entry, fail)]),
+    Object.entries(value).map(([key, entry]) => [key, requireFinite(`${path}[${keyName(key)}]`, entry, fail)]),
   );
 }
 
-function optionalLegend(path: string, value: unknown, fail: Fail): Record<string, JevCriterion> | undefined {
+function optionalLegend(
+  path: string,
+  value: unknown,
+  fail: Fail,
+  keyName: KeyName,
+): Record<string, JevCriterion> | undefined {
   if (value === undefined || value === null) return undefined;
   if (!isRecord(value)) throw fail(`${path} must be an object, got ${describe(value)}`);
   return Object.fromEntries(
     Object.entries(value).map(([key, entry]): [string, JevCriterion] => {
       if (!isCriterion(entry)) {
-        throw fail(`${path}[${quote(key)}] must be a string, object, or array, got ${describe(entry)}`);
+        throw fail(`${path}[${keyName(key)}] must be a string, object, or array, got ${describe(entry)}`);
       }
       return [key, entry];
     }),
@@ -919,13 +749,13 @@ export function resolveFetch(value: unknown, providerLabel: string): typeof fetc
 export function resolveTimeoutMs(value: unknown, fallback: number, field: string, providerLabel: string): number {
   if (value === undefined) return fallback;
   if (!isValidTimerDelay(value)) {
-    throw new JevValidationError(`${providerLabel}: ${field} must be a number of milliseconds in (0, ${MAX_TIMER_MS}]`);
+    throw new JevValidationError(`${providerLabel}: ${field} must be a number of milliseconds in (0, ${MAX_TIMER_DELAY_MS}]`);
   }
   return value;
 }
 
 function isValidTimerDelay(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value) && value > 0 && value <= MAX_TIMER_MS;
+  return typeof value === "number" && Number.isFinite(value) && value > 0 && value <= MAX_TIMER_DELAY_MS;
 }
 
 /** An explicit context window: a positive safe integer, or undefined. */
@@ -999,21 +829,8 @@ function trySetHeader(headers: Headers, name: string, value: string): boolean {
 // Small utilities
 // ---------------------------------------------------------------------------
 
-export function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/** Own-property read, so a polluted Object.prototype cannot supply wire fields. */
-export function own(record: Readonly<Record<string, unknown>>, key: string): unknown {
-  return Object.hasOwn(record, key) ? record[key] : undefined;
-}
-
 function isCriterion(value: unknown): value is JevCriterion {
   return typeof value === "string" || isRecord(value) || Array.isArray(value);
-}
-
-function quote(key: string): string {
-  return JSON.stringify(key.length > 64 ? `${key.slice(0, 64)}…` : key);
 }
 
 /** Short type description for error messages; never echoes string contents. */
@@ -1025,7 +842,7 @@ function describe(value: unknown): string {
   return typeof value;
 }
 
-/** A `type` discriminator is a short protocol token, so it is quoted when it is a string. */
+/** The caller's question `type` (a short protocol token), quoted when it is a string. */
 function describeType(value: unknown): string {
   return typeof value === "string" ? quote(value) : describe(value);
 }

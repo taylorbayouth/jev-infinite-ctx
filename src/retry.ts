@@ -8,7 +8,8 @@
  * and re-chunks the whole document instead (spec 7, 15).
  */
 
-import { JevAbortError, JevInfiniteCTXError, JevProviderError } from "./errors.js";
+import { JevInfiniteCTXError, JevProviderError } from "./errors.js";
+import { abortError, MAX_TIMER_DELAY_MS, throwIfAborted } from "./internal.js";
 
 export interface RetryInfo {
   /** The attempt that just failed (1-based). */
@@ -38,9 +39,6 @@ export interface RetryOptions {
  * header must not stall a chunk indefinitely.
  */
 const MIN_RETRY_AFTER_CAP_MS = 60_000;
-
-/** setTimeout fires immediately for delays above 2^31 − 1 ms, so longer sleeps are clamped. */
-const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 /**
  * Runs `fn` (called with the 1-based attempt number) until it succeeds, the
@@ -150,14 +148,4 @@ function clampTimerDelay(ms: number): number {
     return 0;
   }
   return Math.min(ms, MAX_TIMER_DELAY_MS);
-}
-
-function throwIfAborted(signal: AbortSignal | undefined): void {
-  if (signal?.aborted) {
-    throw abortError(signal);
-  }
-}
-
-function abortError(signal: AbortSignal | undefined): JevAbortError {
-  return new JevAbortError("The operation was aborted.", { cause: signal?.reason });
 }
